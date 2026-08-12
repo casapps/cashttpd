@@ -1,0 +1,14 @@
+services:
+  cashttpd-dev:
+    image: ghcr.io/casapps/cashttpd:devel
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+      args:
+        PROJECT_ORG: casapps
+        PROJECT_NAME: cashttpd
+    ports:
+      - "127.0.0.1:59123:59123"
+    volumes:
+      - ../:/srv/www:ro
+    command: ["--listen", "::1", "--port", "59123", "--dir", "/srv/www", "--debug"]

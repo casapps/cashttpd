@@ -1,0 +1,17 @@
+networks:
+  cashttpd-test:
+    driver: bridge
+
+services:
+  cashttpd-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PROJECT_ORG: casapps
+        PROJECT_NAME: cashttpd
+    networks:
+      - cashttpd-test
+    volumes:
+      - ../tests/fixtures:/srv/www:ro
+    command: ["--listen", "::", "--port", "59123", "--dir", "/srv/www"]

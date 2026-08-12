@@ -1,0 +1,9 @@
+.git/
+.gitignore
+.env
+target/
+xtask/target/
+volumes/
+*.md
+LICENSE.md
+.DS_Store

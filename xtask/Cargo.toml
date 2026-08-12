@@ -1,0 +1,17 @@
+[package]
+name         = "xtask"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT"
+authors      = ["casapps"]
+repository   = "https://github.com/casapps/cashttpd"
+homepage     = "https://github.com/casapps/cashttpd"
+description  = "Rust-based build/release automation for cashttpd (executed inside Docker)"
+publish      = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]

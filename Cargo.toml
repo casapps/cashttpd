@@ -1,0 +1,26 @@
+[workspace]
+members = ["xtask"]
+
+[package]
+name         = "cashttpd"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT"
+authors      = ["casapps"]
+repository   = "https://github.com/casapps/cashttpd"
+homepage     = "https://github.com/casapps/cashttpd"
+description  = "RFC-compliant local-development HTTP/HTTPS server with .htaccess/.htpasswd, CGI, multi-language scripting, and dev-framework proxying"
+
+[[bin]]
+name = "cashttpd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+[dependencies]
