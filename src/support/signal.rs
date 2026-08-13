@@ -54,6 +54,19 @@ impl ShutdownState {
     pub fn clear_child_process(&self) {
         self.child_pid.store(0, Ordering::SeqCst);
     }
+
+    /// Builds a fresh, never-shutdown-requested state without registering
+    /// any real OS signal handler — for tests that need a `ShutdownState`
+    /// to pass into code under test (e.g. `server::apply_reload`) but must
+    /// not risk a real `SIGINT`/`SIGTERM`/`SIGHUP` handler registration
+    /// firing across unrelated tests sharing the same test binary process.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            child_pid: Arc::new(AtomicI32::new(0)),
+        }
+    }
 }
 
 /// Register SIGINT/SIGTERM/SIGHUP handlers and return the shared shutdown

@@ -33,8 +33,6 @@ otherwise always relayed as-is, never intercepted. Still open:
 - PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
   full script path to exist as a literal file/dir and does not yet split a
   trailing extra path segment off after the script name.
-- Live config-file reload (rebind on listen/port/tls change without
-  restart) — `crate::config::load` is only called once, at `serve` startup.
 
 `.htaccess`/`.htpasswd` Apache-compatible per-directory configuration is now
 implemented in `src/server/htaccess.rs` (IDEA.md "`.htaccess`/`.htpasswd`
@@ -189,6 +187,45 @@ opportunistically checks whether the active file's rotate policy has fired
 date-stamped sibling, applies retention, and reopens a fresh active file at
 the plain name; retention is also re-checked once at `Logger::open` (server
 startup) to catch files that aged out while the server wasn't running.
+
+Live config-file reload is now implemented in `src/server/mod.rs`/
+`src/config/mod.rs` (IDEA.md "Configuration file" → "Live reload"):
+`config::config_paths` factors the global-config/per-project-config path
+derivation out of `config::load` so `server::run`'s accept loop can poll
+the mtimes of the exact same two files (`ReloadWatch`) roughly once a
+second without duplicating that logic. On a detected mtime change,
+`apply_reload` re-runs `config::load` with the original startup
+`CliOverrides` (so CLI-flag > env > per-project > global > default
+precedence still holds after a reload) and diffs the result field-by-field
+against the running configuration via three independent predicates —
+`config_needs_listener_rebind` (`listen`/`port`/`tls_enabled`, plus `fqdn`
+only while TLS is active), `config_needs_proxy_restart` (`proxy.*`), and
+`config_needs_logger_reopen` (`log_dir`/rotate/keep) — applying only
+whichever pieces actually changed. Every other field (`directory_listing`,
+`mime_types`, `script_handlers`, `debug`, logging *format* overrides, …)
+is hot-appliable by construction: it is swapped in atomically via a
+`Mutex<Arc<RuntimeState>>` cell that every accept-loop iteration snapshots
+once before spawning its per-connection thread, without dropping the
+listener or any in-flight connection. A `base_dir` change (never
+live-appliable — it is threaded through as a plain, non-swappable path at
+startup) is detected, logged as a warning, recorded on the `/server-info`
+dashboard (`IssueKind::ConfigReloadIssue`), and forced back to the running
+value before the rest of the reload proceeds; a listener-rebind attempt
+that fails (e.g. targeting a privileged port after `drop_privileges_if_root`
+already ran, or a port already in use) is likewise warned/recorded and
+its `listen`/`port`/`tls_enabled`/`fqdn` are reverted to the still-bound
+values, rather than crashing or misreporting the running state. This
+closes out item 1's "Still open" list except for chunked request-body
+decoding and the PATH_INFO/PATH_TRANSLATED gap above. Documented gap: a
+true end-to-end test that calls `server::run` directly was judged unsafe
+to add — `run()` calls `platform::drop_privileges_if_root`, which performs
+an irreversible `setuid`/`setgid` on the *entire test process* when run as
+root (the default inside the `casjaysdev/rust:latest` verification
+container), which would corrupt every other test sharing that binary. The
+same hot-appliable-change-reflected-in-a-request behavior is instead
+covered via `request_over_loopback_opts` directly (bypassing `run()`/
+privilege-drop entirely) in
+`hot_appliable_directory_listing_change_is_reflected_in_a_subsequent_request`.
 
 ## [x] Full CLI flags / config-file loading — closed
 `src/config/mod.rs` now implements the full IDEA.md schema: `Layer`/

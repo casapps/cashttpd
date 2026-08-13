@@ -75,6 +75,11 @@ pub enum IssueKind {
     FrameworkProxyError,
     AccessControlDenial,
     TlsIssue,
+    /// A live config-file reload (IDEA.md "Configuration file" → "Live
+    /// reload") that could not be fully applied — e.g. a `base_dir` change
+    /// (never live-appliable) or a listener rebind that failed (a
+    /// privileged-port rebind after privileges were already dropped).
+    ConfigReloadIssue,
 }
 
 impl IssueKind {
@@ -87,6 +92,7 @@ impl IssueKind {
             IssueKind::FrameworkProxyError => "framework proxy error",
             IssueKind::AccessControlDenial => "access-control denial",
             IssueKind::TlsIssue => "TLS/certificate issue",
+            IssueKind::ConfigReloadIssue => "config reload issue",
         }
     }
 }

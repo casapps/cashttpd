@@ -31,14 +31,30 @@
 //! issue list, entirely from bounded in-memory state distinct from the
 //! durable on-disk access/error log.
 //!
+//! Also implements live config-file reload (IDEA.md "Configuration file" →
+//! "Live reload"): `run`'s accept loop polls the mtimes of the same global/
+//! per-project files `crate::config::load` reads (via
+//! `crate::config::config_paths`) roughly once a second, and on a detected
+//! change re-runs `crate::config::load` with the original startup
+//! `CliOverrides` (so CLI-flag precedence still wins) and diffs the result
+//! against the running configuration to decide what to apply: hot-appliable
+//! settings (`directory_listing`, `mime_types`, `script_handlers`, `debug`,
+//! logging rotate/keep, `proxy.*`, …) are swapped in atomically via a
+//! `RuntimeState` cell; a `listen`/`port`/`tls.enabled`/`fqdn` change
+//! rebinds the listener in place without dropping the process; a change
+//! this project cannot apply live (e.g. `base_dir`, or a rebind that fails
+//! because it targets a privileged port after privileges were already
+//! dropped) is logged as a warning and recorded on the `/server-info`
+//! dashboard, never silently ignored or a crash.
+//!
 //! Still open (tracked in TODO.AI.md): chunked *request* body decoding
-//! (`Content-Length` only) and live config reload.
+//! (`Content-Length` only).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::support::signal;
@@ -57,14 +73,19 @@ pub type ServeOptions = crate::config::Resolved;
 
 /// Parses the `serve` subcommand's CLI flags and layers them over
 /// environment variables and config-file settings via `crate::config::load`
-/// (IDEA.md "Configuration file", "CLI flags (full reference)").
-pub fn parse_serve_options(args: &[String]) -> ServeOptions {
+/// (IDEA.md "Configuration file", "CLI flags (full reference)"). Also
+/// returns the parsed `CliOverrides` themselves — `run` needs them again at
+/// live-reload time so a reload re-runs the exact same CLI-flag > env >
+/// per-project > global > default precedence chain, rather than letting a
+/// file edit override a flag the user passed at startup.
+pub fn parse_serve_options(args: &[String]) -> (ServeOptions, crate::config::CliOverrides) {
     let overrides = parse_cli_overrides(args);
-    crate::config::load(&overrides, true).unwrap_or_else(|err| {
+    let opts = crate::config::load(&overrides, true).unwrap_or_else(|err| {
         eprintln!("cashttpd: warning: config load failed ({err}); using built-in defaults");
         crate::config::load(&crate::config::CliOverrides::default(), false)
             .unwrap_or_else(|_| fallback_defaults())
-    })
+    });
+    (opts, overrides)
 }
 
 fn fallback_defaults() -> ServeOptions {
@@ -156,7 +177,11 @@ pub fn parse_cli_overrides(args: &[String]) -> crate::config::CliOverrides {
 /// `quiet` suppresses ongoing per-request access/error lines on the live
 /// TUI/CLI display (IDEA.md "Logging" → `--quiet`) — file logging is always
 /// unconditional regardless of this flag.
-pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
+pub fn run(
+    opts: ServeOptions,
+    quiet: bool,
+    cli: crate::config::CliOverrides,
+) -> std::io::Result<()> {
     // IDEA.md "TLS certificate resolution": `--fqdn` is required whenever
     // `tls.enabled: true` — fail fast, non-zero exit, no certless/
     // hostnameless HTTPS mode.
@@ -167,16 +192,6 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
         ));
     }
 
-    let host = if opts.listen.contains(':') && !opts.listen.starts_with('[') {
-        format!("[{}]", opts.listen)
-    } else {
-        opts.listen.clone()
-    };
-    let bind_addr = format!("{host}:{}", opts.port);
-
-    let listener = TcpListener::bind(&bind_addr)?;
-    listener.set_nonblocking(true)?;
-
     // TLS certificate resolution can need port 80 (ACME HTTP-01) — resolve
     // it before dropping privileges, not after. Warnings are collected here
     // (rather than recorded directly) because `info::Stats` isn't
@@ -186,24 +201,16 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     // interior mutability via `RefCell` is required to collect warnings
     // without changing that signature.
     let tls_warnings = std::cell::RefCell::new(Vec::<String>::new());
-    let tls_config = if opts.tls_enabled {
-        let fqdn = opts.fqdn.clone().unwrap_or_default();
-        Some(tls::build_server_config(
-            &fqdn,
-            &opts.listen,
-            &opts.base_dir,
-            |msg| {
-                eprintln!("cashttpd: warning: {msg}");
-                tls_warnings.borrow_mut().push(msg.to_string());
-            },
-        )?)
-    } else {
-        None
-    };
+    let (mut listener, tls_config) = bind_listener(&opts, &opts.base_dir, |msg| {
+        eprintln!("cashttpd: warning: {msg}");
+        tls_warnings.borrow_mut().push(msg.to_string());
+    })?;
     let tls_warnings = tls_warnings.into_inner();
 
     // Privileged ports (<1024): bind first, then drop privileges — the
-    // daemon never continues running as root after binding.
+    // daemon never continues running as root after binding. A live-reload
+    // rebind onto a privileged port after this point will fail (expected —
+    // see `apply_reload`), and is logged as a warning rather than crashing.
     crate::platform::drop_privileges_if_root()?;
 
     let shutdown = signal::install_handlers()?;
@@ -226,8 +233,9 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     ));
 
     let banner = format!(
-        "cashttpd {} listening on {bind_addr} (base dir: {}, {})",
+        "cashttpd {} listening on {} (base dir: {}, {})",
         crate::support::version::VERSION,
+        format_bind_addr(&opts),
         base_dir.display(),
         if opts.tls_enabled { "https" } else { "http" }
     );
@@ -247,7 +255,6 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
         println!("{banner}");
     }
 
-    let opts = Arc::new(opts);
     let stats = Arc::new(info::Stats::new(crate::platform::sandboxing_posture()));
     // Startup-time TLS warnings aren't tied to a specific request — recorded
     // with synthetic method/target/status values consistent with that.
@@ -287,15 +294,47 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
         }
     }
 
+    // Live config-file reload (IDEA.md "Configuration file" → "Live
+    // reload"): watch the same two files `crate::config::load` reads, and
+    // bundle everything a reload can swap atomically into one cell so a
+    // connection accepted mid-reload always sees an internally-consistent
+    // snapshot (never, say, a new `opts` paired with the old `logger`).
+    let (global_config_path, project_config_path) = crate::config::config_paths(&cli);
+    let mut reload_watch = ReloadWatch::new(global_config_path, project_config_path);
+    let mut last_reload_check = Instant::now();
+    let runtime: Mutex<Arc<RuntimeState>> = Mutex::new(Arc::new(RuntimeState {
+        opts: Arc::new(opts),
+        tls_config,
+        proxy_target,
+        logger,
+    }));
+
     while !shutdown.is_shutdown_requested() {
+        if last_reload_check.elapsed() >= Duration::from_secs(1) {
+            last_reload_check = Instant::now();
+            if reload_watch.changed() {
+                apply_reload(
+                    &cli,
+                    &runtime,
+                    &mut listener,
+                    &base_dir,
+                    quiet,
+                    &mut proxy_child,
+                    &shutdown,
+                    &stats,
+                );
+            }
+        }
+
         match listener.accept() {
             Ok((stream, addr)) => {
+                let snapshot = Arc::clone(&runtime.lock().unwrap());
                 let base_dir = Arc::clone(&base_dir);
                 let stats = Arc::clone(&stats);
-                let opts = Arc::clone(&opts);
-                let logger = Arc::clone(&logger);
-                let tls_config = tls_config.clone();
-                let proxy_target = proxy_target.clone();
+                let opts = Arc::clone(&snapshot.opts);
+                let logger = Arc::clone(&snapshot.logger);
+                let tls_config = snapshot.tls_config.clone();
+                let proxy_target = snapshot.proxy_target.clone();
                 std::thread::spawn(move || {
                     let conn = match tls_config {
                         Some(config) => match rustls::ServerConnection::new(config) {
@@ -327,7 +366,11 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                logger.error(&format!("accept error: {err}"));
+                runtime
+                    .lock()
+                    .unwrap()
+                    .logger
+                    .error(&format!("accept error: {err}"));
             }
         }
     }
@@ -350,6 +393,310 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     );
 
     Ok(())
+}
+
+/// Formats `opts.listen`/`opts.port` as a bindable socket address string,
+/// bracketing a bare (non-`[...]`-wrapped) IPv6 literal — shared by the
+/// startup bind and every live-reload rebind so they can never drift apart.
+fn format_bind_addr(opts: &ServeOptions) -> String {
+    let host = if opts.listen.contains(':') && !opts.listen.starts_with('[') {
+        format!("[{}]", opts.listen)
+    } else {
+        opts.listen.clone()
+    };
+    format!("{host}:{}", opts.port)
+}
+
+/// Binds the listener and, when `opts.tls_enabled`, resolves the TLS
+/// certificate for it. Used both at startup and for every live-reload
+/// listener rebind (`apply_reload`) so the two paths share one procedure.
+fn bind_listener(
+    opts: &ServeOptions,
+    base_dir: &Path,
+    on_tls_warning: impl Fn(&str),
+) -> std::io::Result<(TcpListener, Option<Arc<rustls::ServerConfig>>)> {
+    let listener = TcpListener::bind(format_bind_addr(opts))?;
+    listener.set_nonblocking(true)?;
+
+    let tls_config = if opts.tls_enabled {
+        let fqdn = opts.fqdn.clone().unwrap_or_default();
+        Some(tls::build_server_config(
+            &fqdn,
+            &opts.listen,
+            base_dir,
+            on_tls_warning,
+        )?)
+    } else {
+        None
+    };
+    Ok((listener, tls_config))
+}
+
+/// Bundles every piece of per-connection runtime configuration a live
+/// config reload can swap atomically (IDEA.md "Configuration file" → "Live
+/// reload") without dropping the accept loop or any already-accepted
+/// connection. Rebuilt wholesale on each applied reload rather than
+/// mutated field-by-field, so a reload is all-or-nothing from any given
+/// connection's point of view: each accept-loop iteration takes one fresh
+/// `Arc::clone` snapshot of this before spawning its per-connection
+/// thread, in place of the plain per-field `Arc::clone`s taken before live
+/// reload existed.
+struct RuntimeState {
+    opts: Arc<ServeOptions>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    proxy_target: Option<Arc<proxy::ProxyTarget>>,
+    logger: Arc<Logger>,
+}
+
+/// Tracks the last-seen mtime of the global and per-project config files so
+/// a reload check only re-reads/re-applies them when at least one actually
+/// changed since the previous check. Comparing mtimes (rather than acting
+/// on every wake) already gives natural debouncing against an editor's
+/// temp-file-rename-into-place — no reload happens unless the mtime
+/// genuinely differs from what was already seen.
+struct ReloadWatch {
+    global_path: PathBuf,
+    project_path: PathBuf,
+    global_mtime: Option<SystemTime>,
+    project_mtime: Option<SystemTime>,
+}
+
+impl ReloadWatch {
+    fn new(global_path: PathBuf, project_path: PathBuf) -> Self {
+        let global_mtime = file_mtime(&global_path);
+        let project_mtime = file_mtime(&project_path);
+        Self {
+            global_path,
+            project_path,
+            global_mtime,
+            project_mtime,
+        }
+    }
+
+    /// Returns `true` (and updates the stored mtimes) when either watched
+    /// file's mtime differs from what was last seen — a file that no
+    /// longer exists reports `None`, which itself counts as a change from
+    /// a previously-`Some` value. Exposed as a directly-callable method,
+    /// separate from the accept loop's own ~1s poll-interval gate, so a
+    /// test can call it synchronously against real files it touches
+    /// without waiting on real wall-clock time.
+    fn changed(&mut self) -> bool {
+        let global_mtime = file_mtime(&self.global_path);
+        let project_mtime = file_mtime(&self.project_path);
+        let changed = global_mtime != self.global_mtime || project_mtime != self.project_mtime;
+        self.global_mtime = global_mtime;
+        self.project_mtime = project_mtime;
+        changed
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Whether `new` differs from `old` in a way that requires closing the
+/// current listener socket and opening a new one (IDEA.md "Live reload" —
+/// `listen`/`port` changing, or `tls.enabled` flipping, re-binds the
+/// listener without dropping the process). An `fqdn` change is folded in
+/// here too, but only while TLS is (or becomes) enabled, since it's the
+/// TLS certificate resolved for the listener that actually depends on it.
+fn config_needs_listener_rebind(old: &ServeOptions, new: &ServeOptions) -> bool {
+    old.listen != new.listen
+        || old.port != new.port
+        || old.tls_enabled != new.tls_enabled
+        || (new.tls_enabled && old.fqdn != new.fqdn)
+}
+
+/// Whether `new` differs from `old` in a way that requires killing the
+/// current framework dev-server child (if any) and resolving/spawning a
+/// fresh one (IDEA.md "Framework dev-server proxying" `proxy.*` keys).
+fn config_needs_proxy_restart(old: &ServeOptions, new: &ServeOptions) -> bool {
+    old.proxy.enabled != new.proxy.enabled
+        || old.proxy.kind != new.proxy.kind
+        || old.proxy.command != new.proxy.command
+        || old.proxy.upstream != new.proxy.upstream
+        || old.proxy.path_prefix != new.proxy.path_prefix
+}
+
+/// Whether `new` differs from `old` in a way that requires reopening the
+/// access/error `Logger` against a new directory or rotate/keep policy
+/// (IDEA.md "Logging" → "Log rotation and retention").
+fn config_needs_logger_reopen(old: &ServeOptions, new: &ServeOptions) -> bool {
+    old.log_dir != new.log_dir
+        || old.logging_access_rotate != new.logging_access_rotate
+        || old.logging_access_keep != new.logging_access_keep
+        || old.logging_error_rotate != new.logging_error_rotate
+        || old.logging_error_keep != new.logging_error_keep
+}
+
+/// One reload attempt: re-runs `crate::config::load` with the original
+/// startup `cli` overrides (so CLI-flag precedence still wins over any
+/// file change) and, when the result actually differs, applies whatever of
+/// it can be applied live — a listener rebind, a framework dev-server
+/// child restart, and/or a `Logger` reopen, each only when that specific
+/// piece actually changed — before atomically swapping `runtime` to the
+/// new snapshot. Anything that cannot be applied live (a `base_dir`
+/// change, or a listener rebind that fails — e.g. targeting a privileged
+/// port after privileges were already dropped) is logged as a warning and
+/// recorded on the `/server-info` dashboard; the server keeps running on
+/// its previous configuration for that piece rather than crashing.
+#[allow(clippy::too_many_arguments)]
+fn apply_reload(
+    cli: &crate::config::CliOverrides,
+    runtime: &Mutex<Arc<RuntimeState>>,
+    listener: &mut TcpListener,
+    base_dir: &Path,
+    quiet: bool,
+    proxy_child: &mut Option<std::process::Child>,
+    shutdown: &signal::ShutdownState,
+    stats: &info::Stats,
+) {
+    let current = Arc::clone(&runtime.lock().unwrap());
+
+    let mut new_opts = match crate::config::load(cli, false) {
+        Ok(o) => o,
+        Err(err) => {
+            let msg = format!("config reload failed: {err}; keeping previous configuration");
+            current.logger.error(&msg);
+            stats.record_issue(
+                info::IssueKind::ConfigReloadIssue,
+                "/",
+                &msg,
+                "RELOAD",
+                "-",
+                0,
+                None,
+            );
+            return;
+        }
+    };
+
+    let mut warnings = Vec::new();
+
+    // `base_dir` cannot change live — the served directory tree, cert
+    // storage path, and log-file name are all derived from it once at
+    // startup and threaded through as a plain (non-swappable) `Arc<Path>`.
+    if new_opts.base_dir != current.opts.base_dir {
+        warnings.push(format!(
+            "base_dir change from {} to {} cannot be applied live (requires a restart); keeping the running base_dir",
+            current.opts.base_dir.display(),
+            new_opts.base_dir.display()
+        ));
+        new_opts.base_dir = current.opts.base_dir.clone();
+    }
+
+    let mut listener_rebound = false;
+    let mut tls_config = current.tls_config.clone();
+    if config_needs_listener_rebind(&current.opts, &new_opts) {
+        let fqdn_for_warning = new_opts.fqdn.clone().unwrap_or_default();
+        match bind_listener(&new_opts, base_dir, |msg| {
+            stats.record_issue(
+                info::IssueKind::TlsIssue,
+                "/",
+                msg,
+                "TLS",
+                &fqdn_for_warning,
+                0,
+                None,
+            );
+        }) {
+            Ok((new_listener, new_tls)) => {
+                *listener = new_listener;
+                tls_config = new_tls;
+                listener_rebound = true;
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "listener rebind to {} (tls={}) failed: {err}; still serving on the previous bind",
+                    format_bind_addr(&new_opts),
+                    new_opts.tls_enabled
+                ));
+                // The bind itself failed, so the process is still listening
+                // on `current`'s address/TLS state — reflect that in the
+                // swapped-in config rather than reporting a `listen`/`port`/
+                // `tls_enabled`/`fqdn` the running listener never actually
+                // took on.
+                new_opts.listen = current.opts.listen.clone();
+                new_opts.port = current.opts.port;
+                new_opts.tls_enabled = current.opts.tls_enabled;
+                new_opts.fqdn = current.opts.fqdn.clone();
+            }
+        }
+    }
+
+    let proxy_target = if config_needs_proxy_restart(&current.opts, &new_opts) {
+        if let Some(mut child) = proxy_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        shutdown.clear_child_process();
+        let target = proxy::resolve_proxy_target(base_dir, &new_opts.proxy).map(Arc::new);
+        match &target {
+            Some(t) => match proxy::spawn_child(t, base_dir) {
+                Ok(child) => {
+                    shutdown.track_child_process(child.id());
+                    stats.set_proxy_child_pid(child.id());
+                    *proxy_child = Some(child);
+                }
+                Err(err) => {
+                    stats.set_proxy_child_pid(0);
+                    warnings.push(format!(
+                        "failed to restart framework dev-server ({}: {}): {err}",
+                        t.kind, t.command
+                    ));
+                }
+            },
+            None => stats.set_proxy_child_pid(0),
+        }
+        target
+    } else {
+        current.proxy_target.clone()
+    };
+
+    let logger = if config_needs_logger_reopen(&current.opts, &new_opts) {
+        std::fs::create_dir_all(&new_opts.log_dir).ok();
+        let name = crate::config::derived_name(base_dir);
+        Arc::new(Logger::open_with_policy(
+            &new_opts.log_dir,
+            &name,
+            quiet,
+            &new_opts.logging_access_rotate,
+            &new_opts.logging_access_keep,
+            &new_opts.logging_error_rotate,
+            &new_opts.logging_error_keep,
+        ))
+    } else {
+        current.logger.clone()
+    };
+
+    let updated = Arc::new(RuntimeState {
+        opts: Arc::new(new_opts),
+        tls_config,
+        proxy_target,
+        logger: logger.clone(),
+    });
+    *runtime.lock().unwrap() = updated;
+
+    logger.error(&format!(
+        "config reload applied{}",
+        if listener_rebound {
+            " (listener rebound)"
+        } else {
+            ""
+        }
+    ));
+    for warning in &warnings {
+        logger.error(&format!("config reload warning: {warning}"));
+        stats.record_issue(
+            info::IssueKind::ConfigReloadIssue,
+            "/",
+            warning,
+            "RELOAD",
+            "-",
+            0,
+            None,
+        );
+    }
 }
 
 /// A parsed HTTP/1.x request line + headers (IDEA.md "Core behavior" /
@@ -2533,4 +2880,235 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    // --- Live config-file reload (IDEA.md "Configuration file" → "Live
+    // reload") ---
+
+    #[test]
+    fn reload_watch_changed_detects_stored_mtime_mismatch() {
+        let dir = unique_dir("reload-watch");
+        fs::create_dir_all(&dir).unwrap();
+        let global = dir.join("config.yaml");
+        let project = dir.join("project.yaml");
+        fs::write(&global, "debug: false\n").unwrap();
+        fs::write(&project, "debug: false\n").unwrap();
+
+        let mut watch = ReloadWatch::new(global.clone(), project.clone());
+        assert!(
+            !watch.changed(),
+            "no change since ReloadWatch::new already captured the current mtimes"
+        );
+
+        // Simulate a prior poll that saw an older project-file mtime than
+        // the one actually on disk right now — exercises the comparison
+        // logic directly, without a real sleep-then-rewrite to force a
+        // coarse filesystem's mtime clock forward.
+        watch.project_mtime = watch.project_mtime.map(|t| t - Duration::from_secs(5));
+        assert!(watch.changed());
+        assert!(
+            !watch.changed(),
+            "second check after re-syncing reports no further change"
+        );
+
+        // A watched file disappearing also counts as a change (Some ->
+        // None), and reappearing counts again (None -> Some).
+        fs::remove_file(&project).unwrap();
+        assert!(watch.changed());
+        assert!(!watch.changed());
+        fs::write(&project, "debug: true\n").unwrap();
+        assert!(watch.changed());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_needs_listener_rebind_detects_listen_port_tls_and_fqdn_changes() {
+        let base = test_opts(PathBuf::from("."));
+        assert!(!config_needs_listener_rebind(&base, &base));
+
+        let mut port_changed = base.clone();
+        port_changed.port = base.port.wrapping_add(1);
+        assert!(config_needs_listener_rebind(&base, &port_changed));
+
+        let mut listen_changed = base.clone();
+        listen_changed.listen = "0.0.0.0".to_string();
+        assert!(config_needs_listener_rebind(&base, &listen_changed));
+
+        let mut tls_flipped = base.clone();
+        tls_flipped.tls_enabled = true;
+        assert!(config_needs_listener_rebind(&base, &tls_flipped));
+
+        // fqdn changing while TLS stays disabled is not a rebind trigger —
+        // nothing about the plain-HTTP listener depends on it.
+        let mut fqdn_changed_no_tls = base.clone();
+        fqdn_changed_no_tls.fqdn = Some("new.test".to_string());
+        assert!(!config_needs_listener_rebind(&base, &fqdn_changed_no_tls));
+
+        // fqdn changing while TLS is (or becomes) enabled does need a
+        // rebind — the resolved certificate depends on it.
+        let mut base_tls = base.clone();
+        base_tls.tls_enabled = true;
+        base_tls.fqdn = Some("old.test".to_string());
+        let mut new_fqdn_tls = base_tls.clone();
+        new_fqdn_tls.fqdn = Some("new.test".to_string());
+        assert!(config_needs_listener_rebind(&base_tls, &new_fqdn_tls));
+    }
+
+    #[test]
+    fn config_needs_proxy_restart_detects_proxy_field_changes() {
+        let base = test_opts(PathBuf::from("."));
+        assert!(!config_needs_proxy_restart(&base, &base));
+
+        let mut other = base.clone();
+        other.proxy.upstream = Some("http://127.0.0.1:9999".to_string());
+        assert!(config_needs_proxy_restart(&base, &other));
+        assert!(!config_needs_listener_rebind(&base, &other));
+    }
+
+    #[test]
+    fn config_needs_logger_reopen_detects_log_dir_and_rotate_keep_changes() {
+        let base = test_opts(PathBuf::from("."));
+        assert!(!config_needs_logger_reopen(&base, &base));
+
+        let mut dir_changed = base.clone();
+        dir_changed.log_dir = std::env::temp_dir().join("cashttpd-reload-elsewhere");
+        assert!(config_needs_logger_reopen(&base, &dir_changed));
+
+        let mut rotate_changed = base.clone();
+        rotate_changed.logging_access_rotate = "weekly".to_string();
+        assert!(config_needs_logger_reopen(&base, &rotate_changed));
+
+        let mut keep_changed = base.clone();
+        keep_changed.logging_error_keep = "7d".to_string();
+        assert!(config_needs_logger_reopen(&base, &keep_changed));
+    }
+
+    #[test]
+    fn hot_appliable_directory_listing_change_needs_no_rebind_proxy_restart_or_logger_reopen() {
+        let base = test_opts(PathBuf::from("."));
+        let mut reloaded = base.clone();
+        reloaded.directory_listing = !base.directory_listing;
+        reloaded.debug = !base.debug;
+
+        assert!(!config_needs_listener_rebind(&base, &reloaded));
+        assert!(!config_needs_proxy_restart(&base, &reloaded));
+        assert!(!config_needs_logger_reopen(&base, &reloaded));
+    }
+
+    #[test]
+    fn hot_appliable_directory_listing_change_is_reflected_in_a_subsequent_request() {
+        let dir = unique_dir("reload-hot-apply");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        fs::write(base_dir.join("secret.txt"), b"shh").unwrap();
+
+        let mut opts = test_opts(base_dir.clone());
+        opts.directory_listing = false;
+        let before = request_over_loopback_opts(opts.clone(), "GET / HTTP/1.1\r\n");
+        assert!(!before.contains("secret.txt"));
+
+        let mut reloaded = opts.clone();
+        reloaded.directory_listing = true;
+        // Exactly the swap `apply_reload` performs for a change like this:
+        // no listener rebind, proxy restart, or logger reopen needed.
+        assert!(!config_needs_listener_rebind(&opts, &reloaded));
+        assert!(!config_needs_proxy_restart(&opts, &reloaded));
+        assert!(!config_needs_logger_reopen(&opts, &reloaded));
+
+        let after = request_over_loopback_opts(reloaded, "GET / HTTP/1.1\r\n");
+        assert!(after.contains("secret.txt"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_reload_rejects_conflicting_bind_and_keeps_serving_old_listener() {
+        let dir = unique_dir("reload-conflict-base");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let config_home = unique_dir("reload-conflict-config-home");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let cli = crate::config::CliOverrides {
+            base_dir: Some(base_dir.clone()),
+            ..Default::default()
+        };
+        let opts = crate::config::load(&cli, true).unwrap();
+
+        let mut listener = TcpListener::bind(format_bind_addr(&opts)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let original_addr = listener.local_addr().unwrap();
+
+        // Occupy a distinct free port and point the per-project config at
+        // it — the reload's rebind attempt must fail against it.
+        let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked_port = blocker.local_addr().unwrap().port();
+        fs::write(
+            &opts.project_config_path,
+            format!("listen: \"127.0.0.1\"\nport: {blocked_port}\n"),
+        )
+        .unwrap();
+
+        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "reload-conflict", true));
+        let runtime = Mutex::new(Arc::new(RuntimeState {
+            opts: Arc::new(opts.clone()),
+            tls_config: None,
+            proxy_target: None,
+            logger: logger.clone(),
+        }));
+        let shutdown = signal::ShutdownState::new_for_test();
+        let stats = info::Stats::new("test");
+        let mut proxy_child: Option<std::process::Child> = None;
+
+        apply_reload(
+            &cli,
+            &runtime,
+            &mut listener,
+            &base_dir,
+            true,
+            &mut proxy_child,
+            &shutdown,
+            &stats,
+        );
+
+        // The listener must still be the original one (rebind rejected) —
+        // a client can still connect to it, proving the server kept
+        // running rather than panicking/exiting.
+        assert_eq!(listener.local_addr().unwrap(), original_addr);
+        TcpStream::connect(original_addr).unwrap();
+
+        // The running config's port must remain the old one.
+        let snapshot = Arc::clone(&runtime.lock().unwrap());
+        assert_eq!(snapshot.opts.port, opts.port);
+
+        // The failure is recorded as a dashboard issue, not silently
+        // dropped.
+        let dashboard = info::render_dashboard(&stats, &snapshot.opts, None);
+        assert!(dashboard.contains("config reload issue"));
+
+        drop(blocker);
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&config_home).ok();
+    }
+
+    // NOTE: a dedicated "base_dir change via the project config file is
+    // ignored and warned about" test was attempted here but dropped: the
+    // project config's own `base_dir` key only overrides anything when the
+    // *original* `CliOverrides.base_dir` is `None` and `CASHTTPD_BASE_DIR`
+    // is unset (config/mod.rs `load`'s documented precedence), which in
+    // turn means the very first `config::load` call also can't be pointed
+    // at an isolated per-test directory via `cli`/the env var — it would
+    // have to fall back to `base_dir = "."`, i.e. the real process cwd,
+    // shared and racy across every test in this binary. The `base_dir`
+    // revert branch itself (just above, in `apply_reload`) is a plain
+    // three-line "force the field back to `current`'s value and push a
+    // warning" — the same pattern this module's listener-rebind-failure
+    // branch uses, and that path *is* covered end-to-end by
+    // `apply_reload_rejects_conflicting_bind_and_keeps_serving_old_listener`
+    // above.
 }

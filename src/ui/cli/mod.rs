@@ -57,8 +57,8 @@ fn run_with_args(args: &[String]) -> i32 {
     // to config (IDEA.md "CLI flags (full reference)").
     if args.iter().any(|a| a == "serve") {
         let quiet = args.iter().any(|a| a == "--quiet");
-        let opts = crate::server::parse_serve_options(args);
-        return match crate::server::run(opts, quiet) {
+        let (opts, cli_overrides) = crate::server::parse_serve_options(args);
+        return match crate::server::run(opts, quiet, cli_overrides) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("cashttpd: fatal: {err}");
