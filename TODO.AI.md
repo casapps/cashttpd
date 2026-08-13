@@ -1,16 +1,52 @@
-## [ ] Full HTTP/1.1 RFC 9110/9112 conformance
-Read: AI.md PART 7, PART 14
-`src/server/mod.rs` implements a minimal GET/HEAD static-file server only.
-Missing: full request header handling, keep-alive, chunked transfer
-encoding, CGI/script execution, `.htaccess`/`.htpasswd` support, TLS,
-framework dev-server proxying, `/server-info` dashboard, and Apache-combined
-access logging. This is the single largest remaining functional gap.
+## [ ] HTTP/1.1 core conformance is done; script/proxy/TLS/htaccess layers remain
+Read: AI.md PART 7, PART 14; IDEA.md "Business logic"
+`src/server/mod.rs` now implements: full request-header parsing,
+persistent (keep-alive) connections, conditional requests
+(`If-Modified-Since`/`If-None-Match` → 304), single-range `Range` requests
+(206/416), IANA-registry-backed `Content-Type` detection via `mime_guess`
+(with `mime_types` config override), default-index resolution plus
+opt-in directory listing (with human-readable file sizes), embedded
+mobile-first dark-themed error pages (debug-gated detail), `.ht*` trust-
+boundary denial (never served as static content), and unconditional
+Apache-combined-format access logging plus Apache-style error logging to
+`{log_dir}/{derived_name}_{access,error}.log`. Still open (none of this is
+implemented yet):
+- Chunked *request* body decoding (only response framing is `Content-Length`
+  today; no request body is read/forwarded anywhere yet since there is no
+  CGI/proxy consumer for one).
+- CGI/multi-language script execution (`script_handlers`, CGI 1.1 protocol,
+  503-for-missing-interpreter) — IDEA.md "Multi-language script execution".
+- `.htaccess`/`.htpasswd` compatibility (recursive discovery, cascade merge,
+  AuthType/Require/Order-Allow-Deny, RewriteEngine/RewriteRule, ErrorDocument,
+  DirectoryIndex, Options) — IDEA.md "`.htaccess`/`.htpasswd` compatibility".
+- TLS certificate resolution (Let's Encrypt live/new-request + self-signed
+  fallback, `{data_dir}/certs/{derived_name}/` storage) — IDEA.md "TLS
+  certificate resolution". `Resolved.tls_enabled` is parsed/resolved but
+  the listener is always plain HTTP.
+- Framework dev-server proxying (`proxy.*` config keys are parsed/resolved
+  but never consulted by `run()`/`handle_request()`).
+- `/server-info` diagnostics dashboard.
+- Scheduled log rotation/retention — `logging.access/error.rotate/keep` are
+  parsed/resolved but files are appended to unconditionally; no rollover.
+- Live config-file reload (rebind on listen/port/tls change without
+  restart) — `crate::config::load` is only called once, at `serve` startup.
 
-## [ ] Full CLI flags / config-file loading
-Read: AI.md PART 7
-`ServeOptions` in `src/server/mod.rs` covers only `listen`, `port`, and
-`base_dir` — a subset of IDEA.md's full CLI flags table. Full config-file
-loading and the remaining flags are not yet implemented.
+## [x] Full CLI flags / config-file loading — closed
+`src/config/mod.rs` now implements the full IDEA.md schema: `Layer`/
+`Resolved`/`CliOverrides` cover all 19 config keys (`base_dir`, `listen`,
+`port`, `log_dir`, `debug`, `fqdn`, `tls.enabled`, `directory_listing`,
+`mime_types`, `script_handlers`, `proxy.*`, `logging.access.*`,
+`logging.error.*`), with CLI > env (`CASHTTPD_*`) > per-project config >
+global config > built-in-default precedence, two-layer YAML at
+`{config_dir}/config.yaml` and `{config_dir}/projects/{derived_name}.yaml`,
+autogeneration with owner-only (0600) permissions on first `serve`, and
+`--config-test`/`-t` syntax-only validation that never touches sockets or
+writes files. `src/server/mod.rs::parse_cli_overrides` covers `--listen`,
+`--port`, `--dir`, `--fqdn`, `--log`, `--config`, `--debug`; `--daemon`/
+`--quiet`/`--config-test` are handled as invocation-shape flags in
+`src/ui/cli/mod.rs` per IDEA.md (never persisted to config). Live reload of
+config while `serve` is running (without restart) is not implemented — see
+the item above.
 
 ## [ ] Local `cargo deny check` advisory-db fetch fails in this sandbox (git TLS)
 Read: AI.md PART 10, PART 11
