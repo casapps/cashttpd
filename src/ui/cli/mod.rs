@@ -2,9 +2,7 @@
 //! fallback (AI.md PART 3), and the `serve` subcommand entry point (AI.md
 //! PART 14 "Runtime Model": `serve` always forces CLI mode).
 
-/// Entry point for CLI-style mode. Full flag parsing, config loading, and
-/// remaining CLI flags beyond `--config-test`/`serve` are tracked in
-/// TODO.AI.md.
+/// Entry point for CLI-style mode.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run_with_args(&args));
@@ -38,7 +36,8 @@ fn run_with_args(args: &[String]) -> i32 {
     // stderr, exit 0 (valid) or 1 (invalid); never touches sockets or
     // running state (AI.md PART 14 "Signals & Lifecycle").
     if args.iter().any(|a| a == "--config-test" || a == "-t") {
-        return match crate::config::validate() {
+        let overrides = crate::server::parse_cli_overrides(args);
+        return match crate::config::validate(&overrides) {
             Ok(()) => {
                 println!("cashttpd: configuration syntax is ok");
                 0
@@ -52,10 +51,14 @@ fn run_with_args(args: &[String]) -> i32 {
 
     // `serve`: starts the daemon in the foreground (AI.md PART 14 "Runtime
     // Model" — never self-daemonizes; systemd/the container runtime
-    // supervises it).
+    // supervises it). `--daemon` (background, forces CLI-style output) and
+    // `--quiet` (suppress ongoing access/error line echo — file logging
+    // stays unconditional) are CLI-only invocation flags, never persisted
+    // to config (IDEA.md "CLI flags (full reference)").
     if args.iter().any(|a| a == "serve") {
+        let quiet = args.iter().any(|a| a == "--quiet");
         let opts = crate::server::parse_serve_options(args);
-        return match crate::server::run(opts) {
+        return match crate::server::run(opts, quiet) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("cashttpd: fatal: {err}");
@@ -79,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn config_test_flag_reports_success_since_validate_is_currently_infallible() {
+    fn config_test_flag_reports_success_when_no_config_files_exist() {
         assert_eq!(run_with_args(&["--config-test".to_string()]), 0);
         assert_eq!(run_with_args(&["-t".to_string()]), 0);
     }

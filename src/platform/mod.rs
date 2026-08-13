@@ -75,6 +75,142 @@ fn ensure_service_account() -> std::io::Result<(nix::unistd::Uid, nix::unistd::G
     Ok((Uid::from_raw(SERVICE_UID), Gid::from_raw(SERVICE_GID)))
 }
 
+/// Per-user platform-standard directories (AI.md PART 4 "Path Rule"),
+/// anchored on the frozen `internal_org`/`internal_name` pair
+/// (`casapps`/`cashttpd`) so a project/org rename never moves user data.
+pub mod paths {
+    use std::path::PathBuf;
+
+    const INTERNAL_ORG: &str = "casapps";
+    const INTERNAL_NAME: &str = "cashttpd";
+
+    fn home() -> PathBuf {
+        #[cfg(windows)]
+        {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
+    }
+
+    /// Per-user config directory — `~/.config/casapps/cashttpd/` on Linux/
+    /// BSD, the macOS `Application Support/.../config/` variant, or
+    /// `%AppData%\casapps\cashttpd\config\` on Windows.
+    pub fn config_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            home()
+                .join("Library/Application Support")
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("config")
+        }
+        #[cfg(windows)]
+        {
+            std::env::var_os("AppData")
+                .map(PathBuf::from)
+                .unwrap_or_else(home)
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("config")
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".config"))
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+        }
+    }
+
+    /// Per-user data directory — see `config_dir()` for the per-OS pattern
+    /// this mirrors. Intended target for TLS certificate storage
+    /// (`{data_dir}/certs/{derived_name}/` per IDEA.md "TLS certificate
+    /// resolution"), which is not yet implemented — see TODO.AI.md.
+    #[allow(dead_code)]
+    pub fn data_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            home()
+                .join("Library/Application Support")
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("data")
+        }
+        #[cfg(windows)]
+        {
+            std::env::var_os("LocalAppData")
+                .map(PathBuf::from)
+                .unwrap_or_else(home)
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("data")
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".local/share"))
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+        }
+    }
+
+    /// Per-user log directory (the default `--log`/`log_dir` target) — see
+    /// `config_dir()` for the per-OS pattern this mirrors.
+    pub fn log_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            home()
+                .join("Library/Logs")
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+        }
+        #[cfg(windows)]
+        {
+            std::env::var_os("LocalAppData")
+                .map(PathBuf::from)
+                .unwrap_or_else(home)
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("logs")
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".local/state"))
+                .join(INTERNAL_ORG)
+                .join(INTERNAL_NAME)
+                .join("logs")
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn config_data_log_dirs_are_distinct_and_non_empty() {
+            let c = config_dir();
+            let d = data_dir();
+            let l = log_dir();
+            assert!(!c.as_os_str().is_empty());
+            assert!(!d.as_os_str().is_empty());
+            assert!(!l.as_os_str().is_empty());
+            assert_ne!(c, d);
+            assert_ne!(d, l);
+        }
+    }
+}
+
 // No unit tests for `drop_privileges_if_root()` / `ensure_service_account()`:
 // the project's toolchain container (`casjaysdev/rust:latest`) runs as real
 // root, so calling `drop_privileges_if_root()` in-process would take the

@@ -26,3 +26,10 @@ panic         = "abort"
 [dependencies]
 signal-hook = "0.3"
 nix         = { version = "0.29", features = ["user", "signal"] }
+# NOTE: no `derive` feature — this toolchain's host target
+# (x86_64-unknown-linux-musl, per `casjaysdev/rust:latest`) cannot build
+# proc-macro crate types ("cannot produce proc-macro for `serde_derive`...
+# does not support these crate types"), so `config/mod.rs` parses/emits
+# YAML via `serde_yaml::Value` directly instead of `#[derive(Deserialize)]`.
+serde_yaml = "0.9"
+mime_guess = "2"
