@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+          - aarch64-pc-windows-gnullvm
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p binaries
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)  ARTIFACT="cashttpd-linux-amd64" ;;
+            aarch64-unknown-linux-musl) ARTIFACT="cashttpd-linux-arm64" ;;
+            x86_64-pc-windows-gnu)      ARTIFACT="cashttpd-windows-amd64.exe" ;;
+            aarch64-pc-windows-gnullvm) ARTIFACT="cashttpd-windows-arm64.exe" ;;
+            x86_64-apple-darwin)        ARTIFACT="cashttpd-darwin-amd64" ;;
+            aarch64-apple-darwin)       ARTIFACT="cashttpd-darwin-arm64" ;;
+          esac
+          case "$TARGET" in
+            *-pc-windows-*) BIN="cashttpd.exe" ;;
+            *)              BIN="cashttpd" ;;
+          esac
+          cp "target/$TARGET/release/$BIN" "binaries/$ARTIFACT"
+          sha256sum "binaries/$ARTIFACT" > "binaries/$ARTIFACT.sha256"
+
+      - name: Verify static linkage
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            *-unknown-linux-musl)
+              ldd "target/$TARGET/release/cashttpd" 2>&1 | grep -qE 'not a dynamic executable|statically linked'
+              ;;
+            *-apple-darwin)
+              otool -L "target/$TARGET/release/cashttpd"
+              ;;
+            *-pc-windows-*)
+              dumpbin /dependents "target/$TARGET/release/cashttpd.exe"
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: cashttpd-${{ matrix.target }}
+          path: binaries/
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # create GitHub release + upload assets
+      contents: write
+      # OIDC token for cosign / attest-build-provenance
+      id-token: write
+      # GitHub artifact attestations (SBOM, provenance)
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # required: full history needed to inspect and push tags
+          fetch-depth: 0
+
+      - name: Ensure release tag
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref }}"
+          if [[ "$ref" != refs/tags/* ]]; then
+            echo "::error::release.yml triggered on non-tag ref '$ref'. Releases require a tag push (refs/tags/v...)."
+            exit 1
+          fi
+          tag="${ref#refs/tags/}"
+          if printf '%s' "$tag" | grep -qP '[[:space:][:cntrl:]]'; then
+            echo "::error::Tag '$tag' contains whitespace or control characters and is not a valid GitHub tag name."
+            exit 1
+          fi
+          git tag -d "$tag" 2>/dev/null || true
+          git push origin ":refs/tags/$tag" 2>/dev/null || true
+          git tag "$tag"
+          git push origin "refs/tags/$tag"
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v6.0.0
+        with:
+          path: binaries
+          pattern: cashttpd-*
+          merge-multiple: true
+
+      - name: Generate SBOM
+        # `cargo-cyclonedx` is not part of casjaysdev/rust:latest (verified
+        # directly against the image), so this builds the local extension
+        # image (docker/Dockerfile.build) rather than `cargo install`-ing it
+        # inline — see that file's header comment for the full rationale.
+        run: |
+          docker build -f docker/Dockerfile.build -t cashttpd-toolchain:release .
+          docker run --rm \
+            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            -v "$PWD":/work -w /work cashttpd-toolchain:release cargo cyclonedx --format json
+          cp bom.json "binaries/cashttpd-bom.json"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --title "$tag" \
+            --generate-notes \
+            binaries/*
+
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068c3c56  # v3.0.0
+        with:
+          subject-path: binaries/cashttpd-*

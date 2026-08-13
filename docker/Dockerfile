@@ -15,15 +15,17 @@ FROM alpine:latest AS runtime
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-RUN apk add --no-cache tini ca-certificates \
-  && addgroup -S cashttpd \
-  && adduser -S -G cashttpd cashttpd
+RUN apk add --no-cache tini ca-certificates
 
 COPY --from=builder /work/target/x86_64-unknown-linux-musl/release/cashttpd /usr/local/bin/cashttpd
 COPY docker/rootfs/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/cashttpd
 
-USER cashttpd
+# No USER directive and no group/user creation here (AI.md PART 5
+# "Container Runtime Rules" -> "Privilege drop, not Dockerfile users").
+# The container starts as root; cashttpd itself creates its own dedicated
+# user/group, sets directory permissions, then drops privileges once
+# initialization completes.
 
 STOPSIGNAL SIGTERM
 

@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # weekly Monday 06:00 UTC
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - run: cargo test --workspace --all-features
+
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # IDEA.md does not declare a coverage threshold, so the PART 8 default of 60% applies.
+      - run: cargo tarpaulin --workspace --all-features --fail-under 60
+
+  docs:
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - run: cargo doc --workspace --no-deps
+
+  license-compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: cargo deny (inside casjaysdev/rust:latest)
+        run: |
+          docker run --rm \
+            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            -v "$PWD":/work -w /work casjaysdev/rust:latest \
+            cargo deny check licenses advisories bans sources
+      # `cargo-about` is not part of casjaysdev/rust:latest (verified: neither
+      # the binary nor `cargo binstall` is present in that image), so this
+      # step builds the local extension image (docker/Dockerfile.build — see
+      # that file's header comment for why it exists) to run the
+      # attribution-drift check.
+      - name: Build toolchain extension image (cargo-about)
+        run: docker build -f docker/Dockerfile.build -t cashttpd-toolchain:ci .
+      - name: Attribution-drift check
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            -v "$PWD":/work -w /work cashttpd-toolchain:ci \
+            cargo about generate about.hbs > LICENSE.generated.md
+          sed -n '/<!-- GENERATED:/,$p' LICENSE.md > LICENSE.committed-generated.md
+          diff LICENSE.committed-generated.md LICENSE.generated.md
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - run: cargo build --release
+
+  upload-artifacts:
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: casjaysdev/rust:latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: cashttpd-linux-amd64
+          path: target/x86_64-unknown-linux-musl/release/cashttpd
+          retention-days: 7
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # required: truffleHog needs full history
+          fetch-depth: 0
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@b634fb72d9901a4f942e5b8e4ef5f7ec59c97e7c  # v3.88.2
+        with:
+          # NEVER use default_branch — it resolves to HEAD post-push and skips the scan
+          base: ${{ github.event.before }}
+          head: ${{ github.sha }}
+          extra_args: --only-verified
+
+  workflow-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Verify all third-party actions are pinned to a 40-char SHA
+        run: |
+          set -eo pipefail
+          bad=$(grep -RhnE '^\s*uses:\s*[^@]+@(v?[0-9]|main|master)' .github/ .gitea/ .forgejo/ 2>/dev/null || true)
+          if [[ -n "$bad" ]]; then
+            echo "::error::Unpinned actions found (must be 40-char SHAs):"
+            echo "$bad"
+            exit 1
+          fi
+
+  vuln-scan:
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('Cargo.lock') != '' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: cargo audit (inside casjaysdev/rust:latest)
+        run: |
+          IMAGE="casjaysdev/rust:latest"
+          docker run --rm -i \
+            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            -v "$PWD":/work -w /work "$IMAGE" cargo audit
+
+  image-scan:
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('docker/Dockerfile') != '' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+      - name: Build local image for scanning
+        run: |
+          docker build -f docker/Dockerfile -t scan-target:ci .
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37  # v0.70.0
+        with:
+          image-ref: scan-target:ci
+          severity: CRITICAL,HIGH
+          exit-code: '1'

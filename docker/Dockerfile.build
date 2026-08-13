@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+# Extended Rust toolchain image — used only by CI steps that need
+# `cargo-about` and `cargo-cyclonedx` for attribution/SBOM generation
+# (AI.md PART 10 "Suggested CI Steps", PART 11 "Required Tooling").
+#
+# casjaysdev/rust:latest is the mandatory base for every other CI step
+# (AI.md PART 5 "Toolchain Image") and this file exists only because that
+# externally maintained image does not currently ship `cargo-about` or
+# `cargo-cyclonedx` (verified directly: neither binary nor `cargo binstall`
+# is present) — the documented "genuine custom need" carve-out for
+# `docker/Dockerfile.build` (AI.md PART 12 checklist / global build rules).
+# Extend, never replace: this always builds FROM casjaysdev/rust:latest.
+
+FROM casjaysdev/rust:latest
+
+# cargo-about's binary target is gated behind the `cli` feature; without it
+# the crate compiles but installs no executable.
+RUN cargo install --locked cargo-about --features cli \
+ && cargo install --locked cargo-cyclonedx

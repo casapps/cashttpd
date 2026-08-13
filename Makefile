@@ -1,9 +1,9 @@
-PROJECT_NAME ?= cashttpd
-IMAGE        ?= casjaysdev/rust:latest
-RUN          := docker run --rm \
+PROJECT_NAME  ?= cashttpd
+PROJECT_IMAGE ?= casjaysdev/rust:latest
+RUN           := docker run --rm \
 	--name "$(PROJECT_NAME)-$$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
 	-v $(PWD):/work -w /work \
-	$(IMAGE)
+	$(PROJECT_IMAGE)
 
 .PHONY: fmt fmt-check lint test build build-release doc run deny about clean
 
@@ -33,7 +33,7 @@ run:
 		--name "$(PROJECT_NAME)-$$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
 		-p 127.0.0.1:59123:59123 \
 		-v $(PWD):/work -w /work \
-		$(IMAGE) cargo run -- --listen ::1 --port 59123 --dir /work
+		$(PROJECT_IMAGE) cargo run -- --listen ::1 --port 59123 --dir /work
 
 deny:
 	$(RUN) cargo deny check licenses advisories bans sources

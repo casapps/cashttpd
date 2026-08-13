@@ -24,3 +24,5 @@ strip         = true
 panic         = "abort"
 
 [dependencies]
+signal-hook = "0.3"
+nix         = { version = "0.29", features = ["user", "signal"] }

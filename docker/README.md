@@ -22,11 +22,14 @@ docker build -f docker/Dockerfile --build-arg PROJECT_ORG=casapps \
 ## Run the server with the port published
 
 ```bash
+PROJECT_NAME="$(basename "$(git rev-parse --show-toplevel)")"
+PROJECT_IMAGE="cashttpd:latest"
+
 docker run --rm \
-  --name "cashttpd-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+  --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
   -p 127.0.0.1:59123:59123 \
   -v "$PWD":/srv/www:ro \
-  cashttpd:latest --listen ::1 --port 59123 --dir /srv/www
+  "$PROJECT_IMAGE" --listen ::1 --port 59123 --dir /srv/www
 ```
 
 Then from the host:

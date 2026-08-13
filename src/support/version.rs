@@ -2,7 +2,10 @@
 
 /// Version string: `release.txt` when present at build time, else the
 /// `Cargo.toml` package version.
-pub const VERSION: &str = option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+pub const VERSION: &str = match option_env!("APP_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// Official site URL, empty when unset (`site.txt` > `IDEA.md` > env > empty).
 pub const OFFICIAL_SITE: &str = match option_env!("APP_OFFICIAL_SITE") {
