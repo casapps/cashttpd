@@ -33,10 +33,6 @@ otherwise always relayed as-is, never intercepted. Still open:
 - PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
   full script path to exist as a literal file/dir and does not yet split a
   trailing extra path segment off after the script name.
-- TLS certificate resolution (Let's Encrypt live/new-request + self-signed
-  fallback, `{data_dir}/certs/{derived_name}/` storage) — IDEA.md "TLS
-  certificate resolution". `Resolved.tls_enabled` is parsed/resolved but
-  the listener is always plain HTTP.
 - Framework dev-server proxying (`proxy.*` config keys are parsed/resolved
   but never consulted by `run()`/`handle_request()`).
 - `/server-info` diagnostics dashboard.
@@ -76,6 +72,36 @@ gaps:
   commonly-documented approximation (deny-always-wins-if-matched for
   `allow,deny`; allow-overrides-deny for `deny,allow`), not Apache's exact
   directive-by-directive last-match-wins evaluation.
+
+TLS termination and certificate resolution are now implemented in
+`src/server/tls.rs` (IDEA.md "TLS certificate resolution"): `run()` fails
+fast with a non-zero exit when `tls.enabled` is true and no `--fqdn`/`fqdn`
+was provided. `build_server_config` resolves a certificate via 3-tier
+fallthrough, first match wins — (1) scan `/etc/letsencrypt/live/**`,
+resolving symlinks into `archive/`, for a live cert matching `{fqdn}` that
+is readable and currently valid (validity window extracted via a hand-
+rolled DER walk — `der_read_tlv`/`parse_validity`/`parse_asn1_time`/
+`days_from_civil` — since the toolchain's musl-hosted `rustc` cannot
+compile the proc-macro-based `x509-parser`); (2) if step 1 finds nothing
+and `--listen` resolves to a public/routable address (`is_public_addr`),
+attempt Let's Encrypt via a full hand-rolled ACME v2 (RFC 8555) HTTP-01
+client (`mod acme` — directory discovery, JWS-signed newAccount/newOrder,
+authorization + http-01 challenge with a temporary port-80 responder,
+CSR via `rcgen`, finalize, and certificate download), falling back to
+self-signed on any ACME failure rather than propagating a hard error; (3)
+self-signed fallback valid 10 years (`generate_self_signed`). Certs/keys
+are stored at `{data_dir}/certs/{derived_name}/`; host Let's Encrypt certs
+are used in place, never copied. TLS termination is wired into the accept
+loop in `server::mod` via a `Conn` enum (`Plain(TcpStream)` /
+`Tls(Box<rustls::StreamOwned<...>>)`) so the existing plain-HTTP request
+pipeline needs no further changes. Cert resolution runs before privilege
+drop (it may need port 80 for ACME HTTP-01). Documented gap: live ACME
+issuance against the real Let's Encrypt service cannot be exercised in
+this sandboxed dev/CI environment (no real public FQDN, no guaranteed
+port-80 reachability) — the client is implemented in full per RFC 8555
+and falls back safely on failure, but genuine issuance against Let's
+Encrypt's production or staging endpoints is a manual-verification-only
+gap, not a stub.
 
 Scheduled log rotation/retention is now implemented in
 `src/support/rotation.rs` (`daily`/`weekly`/`monthly`/`yearly`, `NMB`/`NGB`,

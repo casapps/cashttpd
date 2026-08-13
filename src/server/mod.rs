@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +33,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::support::signal;
 
 mod htaccess;
+mod tls;
+
+use tls::Conn;
 
 /// Effective runtime configuration for `serve` — the fully layered result
 /// of IDEA.md's "CLI flag > env var > per-project config > global config >
@@ -141,6 +144,16 @@ pub fn parse_cli_overrides(args: &[String]) -> crate::config::CliOverrides {
 /// TUI/CLI display (IDEA.md "Logging" → `--quiet`) — file logging is always
 /// unconditional regardless of this flag.
 pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
+    // IDEA.md "TLS certificate resolution": `--fqdn` is required whenever
+    // `tls.enabled: true` — fail fast, non-zero exit, no certless/
+    // hostnameless HTTPS mode.
+    if opts.tls_enabled && opts.fqdn.as_deref().unwrap_or("").is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tls.enabled is true but no --fqdn/fqdn was provided (required whenever TLS is on)",
+        ));
+    }
+
     let host = if opts.listen.contains(':') && !opts.listen.starts_with('[') {
         format!("[{}]", opts.listen)
     } else {
@@ -150,6 +163,20 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
 
     let listener = TcpListener::bind(&bind_addr)?;
     listener.set_nonblocking(true)?;
+
+    // TLS certificate resolution can need port 80 (ACME HTTP-01) — resolve
+    // it before dropping privileges, not after.
+    let tls_config = if opts.tls_enabled {
+        let fqdn = opts.fqdn.clone().unwrap_or_default();
+        Some(tls::build_server_config(
+            &fqdn,
+            &opts.listen,
+            &opts.base_dir,
+            |msg| eprintln!("cashttpd: warning: {msg}"),
+        )?)
+    } else {
+        None
+    };
 
     // Privileged ports (<1024): bind first, then drop privileges — the
     // daemon never continues running as root after binding.
@@ -207,9 +234,23 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
                 let request_count = Arc::clone(&request_count);
                 let opts = Arc::clone(&opts);
                 let logger = Arc::clone(&logger);
+                let tls_config = tls_config.clone();
                 std::thread::spawn(move || {
+                    let conn = match tls_config {
+                        Some(config) => match rustls::ServerConnection::new(config) {
+                            Ok(session) => {
+                                Conn::Tls(Box::new(rustls::StreamOwned::new(session, stream)))
+                            }
+                            Err(err) => {
+                                logger
+                                    .error(&format!("TLS session setup failed for {addr}: {err}"));
+                                return;
+                            }
+                        },
+                        None => Conn::Plain(stream),
+                    };
                     if let Err(err) = serve_connection(
-                        stream,
+                        conn,
                         &base_dir,
                         &opts,
                         &logger,
@@ -287,16 +328,15 @@ fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Option<Request>> 
 /// Serves every keep-alive request on one connection (RFC 9112 §9.3 —
 /// HTTP/1.1 connections are persistent unless `Connection: close` is sent).
 fn serve_connection(
-    stream: TcpStream,
+    conn: Conn,
     base_dir: &Path,
     opts: &ServeOptions,
     logger: &Logger,
     client: &str,
     request_count: &AtomicU64,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+    conn.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(conn);
 
     loop {
         let request = match parse_request(&mut reader) {
@@ -326,7 +366,7 @@ fn serve_connection(
         }
 
         let outcome = handle_request(
-            &mut writer,
+            reader.get_mut(),
             base_dir,
             opts,
             &request,
@@ -430,7 +470,7 @@ fn path_contains_symlink(base_dir: &Path, candidate: &Path) -> bool {
 /// configured `ErrorDocument` target if one exists for `status`, else falls
 /// back to the embedded default error page.
 fn respond_with_error_document(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     status: u16,
     request: &Request,
     opts: &ServeOptions,
@@ -474,7 +514,7 @@ fn respond_with_error_document(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_request(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     base_dir: &Path,
     opts: &ServeOptions,
     request: &Request,
@@ -809,7 +849,7 @@ fn parse_cgi_output(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
 /// detail folded in under `--debug` (IDEA.md "Debug/error forwarding" —
 /// only used when the script produced no usable output at all).
 fn respond_script_failure(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     request: &Request,
     opts: &ServeOptions,
     keep_alive: bool,
@@ -839,7 +879,7 @@ fn respond_script_failure(
 /// "No artificial resource limits" (IDEA.md "Security").
 #[allow(clippy::too_many_arguments)]
 fn dispatch_script(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     base_dir: &Path,
     script_path: &Path,
     route: &ScriptRoute,
@@ -1172,7 +1212,7 @@ fn content_type_for(path: &Path, opts: &ServeOptions) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn serve_file(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     path: &Path,
     request: &Request,
     opts: &ServeOptions,
@@ -1286,7 +1326,7 @@ fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
 }
 
 fn serve_directory_listing(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     base_dir: &Path,
     dir: &Path,
     raw_path: &str,
@@ -1424,7 +1464,7 @@ fn error_page_with_trace(
 }
 
 fn respond_error(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     status: u16,
     request: &Request,
     opts: &ServeOptions,
@@ -1447,7 +1487,7 @@ fn respond_error(
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     status: u16,
     reason: &str,
     body: &[u8],
@@ -1649,6 +1689,7 @@ impl Logger {
 mod tests {
     use super::*;
     use std::fs;
+    use std::net::TcpStream;
 
     fn unique_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -1718,12 +1759,12 @@ mod tests {
         assert!(o.base_dir.is_none());
     }
 
-    fn loopback_pair() -> (TcpStream, TcpStream) {
+    fn loopback_pair() -> (Conn, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
-        (server, client)
+        (Conn::Plain(server), client)
     }
 
     fn request_over_loopback(base_dir: &Path, request_line: &str) -> String {
@@ -1738,7 +1779,15 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, &base_dir, &opts, &logger, "127.0.0.1:1", &count).unwrap();
+            serve_connection(
+                Conn::Plain(stream),
+                &base_dir,
+                &opts,
+                &logger,
+                "127.0.0.1:1",
+                &count,
+            )
+            .unwrap();
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(request_line.as_bytes()).unwrap();
@@ -2159,7 +2208,15 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, &base_dir, &opts, &logger, "127.0.0.1:1", &count).unwrap();
+            serve_connection(
+                Conn::Plain(stream),
+                &base_dir,
+                &opts,
+                &logger,
+                "127.0.0.1:1",
+                &count,
+            )
+            .unwrap();
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(request_line.as_bytes()).unwrap();

@@ -46,3 +46,39 @@ base64 = "0.22"
 # `RewriteRule`/`RewriteCond`/`RedirectMatch` pattern matching (IDEA.md
 # ".htaccess" `mod_rewrite`/`mod_alias` semantics).
 regex = "1"
+# TLS certificate resolution (IDEA.md "TLS certificate resolution"): `rustls`
+# terminates HTTPS and (as a client) drives the ACME v2 HTTPS calls (PART 5
+# "Pure-Rust Library Stack" — TLS row); `webpki-roots` supplies the Mozilla
+# root store `rustls` needs to verify Let's Encrypt's own TLS certificate
+# when this server acts as an ACME client; `rcgen` generates self-signed
+# certs and ACME CSRs (pure Rust, uses `ring` internally — pre-granted per
+# PART 5); `ring` signs the ACME account/JWS requests (ECDSA P-256);
+# `serde_json` encodes/decodes ACME JSON payloads.
+#
+# The ACME v2 (RFC 8555) HTTP-01 flow's own HTTP/1.1 request/response
+# framing is hand-rolled directly on `rustls::ClientConnection` + `TcpStream`
+# (`server::tls`) rather than using an HTTP client crate (`ureq`/`reqwest`):
+# both pull in the `url` crate, which pulls `idna` -> `idna_adapter` ->
+# `icu_*` -> `displaydoc`, a proc-macro crate — and this project's
+# musl-hosted toolchain (`casjaysdev/rust:latest`; `rustc -vV` reports host
+# `x86_64-unknown-linux-musl`) cannot compile proc-macro crates at all
+# (confirmed directly: "cannot produce proc-macro for ... as the target ...
+# does not support these crate types", reproduced against both
+# `asn1-rs-derive` and `displaydoc`). Since this server already hand-rolls
+# HTTP/1.1 request parsing for its own listener (`parse_request` in
+# `server/mod.rs`), and validity-date extraction from Let's-Encrypt-live
+# host certs needs only a narrow, well-specified DER walk, both are
+# hand-rolled rather than adding a dependency — matching this codebase's
+# existing precedent (`apr1_crypt`, the `mod_rewrite` engine) of
+# implementing bounded protocol logic directly when the alternative is a
+# heavyweight dependency this toolchain cannot build anyway.
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots   = "0.26"
+rcgen          = "0.13"
+ring           = "0.17"
+serde_json     = "1"
+# Self-signed cert validity window (`server::tls::generate_self_signed`) —
+# the non-macro subset already pulled transitively by `rcgen`, used
+# directly rather than hand-rolling yet another date type.
+time           = "0.3"
