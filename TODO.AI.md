@@ -26,10 +26,18 @@ implemented yet):
 - Framework dev-server proxying (`proxy.*` config keys are parsed/resolved
   but never consulted by `run()`/`handle_request()`).
 - `/server-info` diagnostics dashboard.
-- Scheduled log rotation/retention — `logging.access/error.rotate/keep` are
-  parsed/resolved but files are appended to unconditionally; no rollover.
 - Live config-file reload (rebind on listen/port/tls change without
   restart) — `crate::config::load` is only called once, at `serve` startup.
+
+Scheduled log rotation/retention is now implemented in
+`src/support/rotation.rs` (`daily`/`weekly`/`monthly`/`yearly`, `NMB`/`NGB`,
+and combined policies for `rotate`; `none`/`N`/`Nd`/`Nw`/`Nm`/`forever` for
+`keep`) and wired into `server::LogStream`/`Logger`: each write
+opportunistically checks whether the active file's rotate policy has fired
+(time boundary crossed or size limit reached), renames it to a
+date-stamped sibling, applies retention, and reopens a fresh active file at
+the plain name; retention is also re-checked once at `Logger::open` (server
+startup) to catch files that aged out while the server wasn't running.
 
 ## [x] Full CLI flags / config-file loading — closed
 `src/config/mod.rs` now implements the full IDEA.md schema: `Layer`/

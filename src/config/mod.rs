@@ -158,15 +158,11 @@ pub struct Resolved {
     pub proxy: ProxyLayer,
     #[allow(dead_code)]
     pub logging_access_format: String,
-    #[allow(dead_code)]
     pub logging_access_rotate: String,
-    #[allow(dead_code)]
     pub logging_access_keep: String,
     #[allow(dead_code)]
     pub logging_error_format: String,
-    #[allow(dead_code)]
     pub logging_error_rotate: String,
-    #[allow(dead_code)]
     pub logging_error_keep: String,
     #[allow(dead_code)]
     pub project_config_path: PathBuf,

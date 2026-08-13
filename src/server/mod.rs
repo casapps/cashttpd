@@ -154,7 +154,15 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     );
     std::fs::create_dir_all(&opts.log_dir).ok();
     let name = crate::config::derived_name(&base_dir);
-    let logger = Arc::new(Logger::open(&opts.log_dir, &name, quiet));
+    let logger = Arc::new(Logger::open_with_policy(
+        &opts.log_dir,
+        &name,
+        quiet,
+        &opts.logging_access_rotate,
+        &opts.logging_access_keep,
+        &opts.logging_error_rotate,
+        &opts.logging_error_keep,
+    ));
 
     let banner = format!(
         "cashttpd {} listening on {bind_addr} (base dir: {}, {})",
@@ -776,28 +784,120 @@ fn write_response(
     Ok((status, body.len() as u64))
 }
 
+/// One log stream (access or error): its open file handle, path, and
+/// rotation/retention state (IDEA.md "Log rotation and retention").
+struct LogStream {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    rotate: crate::support::rotation::RotatePolicy,
+    keep: crate::support::rotation::KeepPolicy,
+    period_start: u64,
+}
+
+impl LogStream {
+    fn open(path: PathBuf, rotate_spec: &str, keep_spec: &str) -> Self {
+        let rotate = crate::support::rotation::parse_rotate(rotate_spec);
+        let keep = crate::support::rotation::parse_keep(keep_spec);
+        // Retention is checked once at startup, to catch files that aged
+        // out while the server wasn't running (IDEA.md "Retention is
+        // checked at each rotation ... and once at server startup").
+        crate::support::rotation::apply_retention(&path, keep).ok();
+        let period_start = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        Self {
+            path,
+            file,
+            rotate,
+            keep,
+            period_start,
+        }
+    }
+
+    /// Rotates the active file if its rotate policy requires it, then
+    /// reopens a fresh active file. Checked opportunistically before every
+    /// write rather than via a background timer.
+    fn maybe_rotate(&mut self) {
+        let current_len = self
+            .file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if !crate::support::rotation::should_rotate(&self.rotate, current_len, self.period_start) {
+            return;
+        }
+        self.file = None;
+        if crate::support::rotation::rotate_file(&self.path, self.keep).is_ok() {
+            self.period_start = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            self.file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .ok();
+        }
+    }
+
+    fn write_line(&mut self, line: &str) {
+        self.maybe_rotate();
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
 /// Unconditional access/error file logging (IDEA.md "Logging") — Apache
 /// combined access format and Apache-style error format, written under
-/// `{log_dir}/{derived_name}_{access,error}.log`. Scheduled rotation/
-/// retention is not yet implemented (see module doc comment).
+/// `{log_dir}/{derived_name}_{access,error}.log`, with time/size rotation
+/// and age/count retention per IDEA.md "Log rotation and retention".
 struct Logger {
-    access: std::sync::Mutex<Option<std::fs::File>>,
-    error: std::sync::Mutex<Option<std::fs::File>>,
+    access: std::sync::Mutex<LogStream>,
+    error: std::sync::Mutex<LogStream>,
     quiet: bool,
 }
 
 impl Logger {
+    #[cfg(test)]
     fn open(log_dir: &Path, name: &str, quiet: bool) -> Self {
-        let access = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join(format!("{name}_access.log")))
-            .ok();
-        let error = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join(format!("{name}_error.log")))
-            .ok();
+        Self::open_with_policy(log_dir, name, quiet, "daily", "30d", "daily", "30d")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_policy(
+        log_dir: &Path,
+        name: &str,
+        quiet: bool,
+        access_rotate: &str,
+        access_keep: &str,
+        error_rotate: &str,
+        error_keep: &str,
+    ) -> Self {
+        let access = LogStream::open(
+            log_dir.join(format!("{name}_access.log")),
+            access_rotate,
+            access_keep,
+        );
+        let error = LogStream::open(
+            log_dir.join(format!("{name}_error.log")),
+            error_rotate,
+            error_keep,
+        );
         Self {
             access: std::sync::Mutex::new(access),
             error: std::sync::Mutex::new(error),
@@ -838,9 +938,7 @@ impl Logger {
             print!("{line}");
         }
         if let Ok(mut guard) = self.access.lock() {
-            if let Some(f) = guard.as_mut() {
-                let _ = f.write_all(line.as_bytes());
-            }
+            guard.write_line(&line);
         }
     }
 
@@ -854,9 +952,7 @@ impl Logger {
         let line = format!("[{now}] [error] {message}\n");
         eprint!("{line}");
         if let Ok(mut guard) = self.error.lock() {
-            if let Some(f) = guard.as_mut() {
-                let _ = f.write_all(line.as_bytes());
-            }
+            guard.write_line(&line);
         }
     }
 }
