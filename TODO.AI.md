@@ -33,7 +33,6 @@ otherwise always relayed as-is, never intercepted. Still open:
 - PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
   full script path to exist as a literal file/dir and does not yet split a
   trailing extra path segment off after the script name.
-- `/server-info` diagnostics dashboard.
 - Live config-file reload (rebind on listen/port/tls change without
   restart) — `crate::config::load` is only called once, at `serve` startup.
 
@@ -70,6 +69,38 @@ gaps:
   commonly-documented approximation (deny-always-wins-if-matched for
   `allow,deny`; allow-overrides-deny for `deny,allow`), not Apache's exact
   directive-by-directive last-match-wins evaluation.
+
+The `/server-info` diagnostics dashboard is now implemented in
+`src/server/info.rs` (IDEA.md "`/server-info` diagnostics dashboard"): a
+`Stats` struct, constructed once in `run()` and shared via `Arc` into every
+connection/request, tracks totals-since-start by method/status(exact and
+class)/handler type, bytes sent/received, a 60-second rolling requests/sec
+window (per-second bucket map, pruned, never a full timestamp history),
+per-handler-type latency (min/avg/max plus p50/p95 over a bounded 256-sample
+reservoir), in-flight request count and active-upstream-proxy-connection
+count (both via RAII `InFlightGuard`/`UpstreamGuard` covering every early
+return), bounded top-10 most-requested/most-error-prone paths, and process
+uptime. A grouped `IssueList` records the full IDEA.md issue taxonomy
+(broken static references, script/CGI failures with captured stderr,
+missing interpreters, framework proxy errors, access-control denials) keyed
+by `(kind, path, cause)` with an occurrence count, last-seen timestamp, and
+per-occurrence request context, bounded to 200 groups/20 occurrences per
+group with oldest-entry eviction. `render_dashboard` produces a dependency-
+free HTML page styled consistently with the existing embedded error pages,
+using `<details>`/`<summary>` for click-through issue detail. `GET`/`HEAD
+/server-info` is dispatched as a built-in route in `handle_request`, before
+the framework-proxy prefix check and before the `.htaccess` 6-phase
+pipeline, always on (never `--debug`-gated) and never resolved against the
+filesystem. Instrumentation is wired directly into the existing dispatch
+call sites (`proxy::proxy_request`, `.htaccess` denial points, the 404
+canonicalize-failure path, `serve_directory_listing`, `dispatch_script`,
+`serve_file`) rather than restructuring return types across the codebase.
+Documented gap: "missing-language-module" failures (e.g. a PHP script
+needing an uninstalled `mysqli` extension) are not separately detected from
+ordinary script failures — cashttpd has no language-aware parsing of
+arbitrary script stderr/stdout to distinguish that specific cause, so such
+failures are recorded as ordinary `ScriptFailure` issues with the script's
+own captured stderr, not as a distinct `MissingLanguageModule` entry.
 
 TLS termination and certificate resolution are now implemented in
 `src/server/tls.rs` (IDEA.md "TLS certificate resolution"): `run()` fails

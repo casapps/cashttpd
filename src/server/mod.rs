@@ -23,21 +23,28 @@
 //! requests under a `path_prefix` are relayed to a spawned dev-server child
 //! process, streamed both ways, with WebSocket/`Upgrade` support.
 //!
+//! Also implements the `/server-info` diagnostics dashboard (`server::info`,
+//! IDEA.md "`/server-info` diagnostics dashboard"): a built-in, always-on
+//! route (dispatched before the framework-proxy prefix check and before the
+//! `.htaccess` 6-phase pipeline) rendering live request/response stats,
+//! per-handler-type latency, hot paths, and a grouped, click-through error/
+//! issue list, entirely from bounded in-memory state distinct from the
+//! durable on-disk access/error log.
+//!
 //! Still open (tracked in TODO.AI.md): chunked *request* body decoding
-//! (`Content-Length` only), the `/server-info` dashboard, and live config
-//! reload.
+//! (`Content-Length` only) and live config reload.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::support::signal;
 
 mod htaccess;
+mod info;
 mod proxy;
 mod tls;
 
@@ -171,18 +178,29 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     listener.set_nonblocking(true)?;
 
     // TLS certificate resolution can need port 80 (ACME HTTP-01) — resolve
-    // it before dropping privileges, not after.
+    // it before dropping privileges, not after. Warnings are collected here
+    // (rather than recorded directly) because `info::Stats` isn't
+    // constructed until after privilege drop/signal install below; they are
+    // folded into the dashboard's issue list as `TlsIssue` once it exists.
+    // `build_server_config`'s callback is `impl Fn(&str)`, not `FnMut` —
+    // interior mutability via `RefCell` is required to collect warnings
+    // without changing that signature.
+    let tls_warnings = std::cell::RefCell::new(Vec::<String>::new());
     let tls_config = if opts.tls_enabled {
         let fqdn = opts.fqdn.clone().unwrap_or_default();
         Some(tls::build_server_config(
             &fqdn,
             &opts.listen,
             &opts.base_dir,
-            |msg| eprintln!("cashttpd: warning: {msg}"),
+            |msg| {
+                eprintln!("cashttpd: warning: {msg}");
+                tls_warnings.borrow_mut().push(msg.to_string());
+            },
         )?)
     } else {
         None
     };
+    let tls_warnings = tls_warnings.into_inner();
 
     // Privileged ports (<1024): bind first, then drop privileges — the
     // daemon never continues running as root after binding.
@@ -230,7 +248,20 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     }
 
     let opts = Arc::new(opts);
-    let request_count = Arc::new(AtomicU64::new(0));
+    let stats = Arc::new(info::Stats::new(crate::platform::sandboxing_posture()));
+    // Startup-time TLS warnings aren't tied to a specific request — recorded
+    // with synthetic method/target/status values consistent with that.
+    for warning in &tls_warnings {
+        stats.record_issue(
+            info::IssueKind::TlsIssue,
+            "/",
+            warning,
+            "TLS",
+            opts.fqdn.as_deref().unwrap_or(""),
+            0,
+            None,
+        );
+    }
     let started_at = Instant::now();
 
     // Framework dev-server proxying (IDEA.md "Framework dev-server
@@ -244,6 +275,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
         match proxy::spawn_child(target, &base_dir) {
             Ok(child) => {
                 shutdown.track_child_process(child.id());
+                stats.set_proxy_child_pid(child.id());
                 proxy_child = Some(child);
             }
             Err(err) => {
@@ -259,7 +291,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
         match listener.accept() {
             Ok((stream, addr)) => {
                 let base_dir = Arc::clone(&base_dir);
-                let request_count = Arc::clone(&request_count);
+                let stats = Arc::clone(&stats);
                 let opts = Arc::clone(&opts);
                 let logger = Arc::clone(&logger);
                 let tls_config = tls_config.clone();
@@ -284,7 +316,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
                         &opts,
                         &logger,
                         &addr.to_string(),
-                        &request_count,
+                        &stats,
                         &proxy_target,
                     ) {
                         logger.error(&format!("connection error from {addr}: {err}"));
@@ -314,7 +346,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     println!(
         "cashttpd: graceful shutdown complete after {}, served {} requests",
         crate::support::format::duration(started_at.elapsed().as_secs()),
-        crate::support::format::count(request_count.load(Ordering::Relaxed))
+        crate::support::format::count(stats.total_requests())
     );
 
     Ok(())
@@ -375,7 +407,7 @@ fn serve_connection(
     opts: &ServeOptions,
     logger: &Logger,
     client: &str,
-    request_count: &AtomicU64,
+    stats: &info::Stats,
     proxy_target: &Option<Arc<proxy::ProxyTarget>>,
 ) -> std::io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -387,7 +419,6 @@ fn serve_connection(
             Ok(None) => return Ok(()),
             Err(_) => return Ok(()),
         };
-        request_count.fetch_add(1, Ordering::Relaxed);
 
         let keep_alive = request
             .headers
@@ -417,6 +448,7 @@ fn serve_connection(
             client,
             keep_alive,
             proxy_target,
+            stats,
         );
         let (status, bytes) = match outcome {
             Ok(v) => v,
@@ -425,6 +457,13 @@ fn serve_connection(
                 return Ok(());
             }
         };
+        stats.record_totals(
+            &request.method,
+            &request.path,
+            status,
+            bytes,
+            body.len() as u64,
+        );
         logger.access(
             client,
             &request.method,
@@ -566,7 +605,10 @@ fn handle_request(
     client: &str,
     keep_alive: bool,
     proxy_target: &Option<Arc<proxy::ProxyTarget>>,
+    stats: &info::Stats,
 ) -> std::io::Result<(u16, u64)> {
+    let _in_flight = stats.in_flight_guard();
+    let handler_started = Instant::now();
     let head_only = request.method == "HEAD";
     let known_method = matches!(
         request.method.as_str(),
@@ -584,6 +626,28 @@ fn handle_request(
         return respond_error(stream, 403, request, opts, keep_alive);
     }
 
+    // The `/server-info` diagnostics dashboard (IDEA.md "`/server-info`
+    // diagnostics dashboard") is a synthetic, built-in route dispatched
+    // before the framework-proxy prefix check and before the `.htaccess`
+    // 6-phase pipeline — always on, never `--debug`-gated, and never
+    // resolved against the filesystem, so it can never surface anything
+    // outside `base_dir` or any `.ht*` content.
+    if decoded == "/server-info" && (request.method == "GET" || request.method == "HEAD") {
+        let html = info::render_dashboard(stats, opts, proxy_target.as_deref());
+        return write_response(
+            stream,
+            200,
+            "OK",
+            html.as_bytes(),
+            head_only,
+            keep_alive,
+            &[(
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )],
+        );
+    }
+
     let remote_ip = client.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(client);
 
     // Framework dev-server proxying (IDEA.md "Framework dev-server
@@ -592,7 +656,24 @@ fn handle_request(
     // `.htaccess` pipeline below; everything else still goes through it.
     if let Some(target) = proxy_target {
         if decoded.starts_with(target.path_prefix.as_str()) {
-            return proxy::proxy_request(stream, target, request, body, client, opts, keep_alive);
+            let _upstream = stats.upstream_guard();
+            let outcome =
+                proxy::proxy_request(stream, target, request, body, client, opts, keep_alive);
+            stats.record_handler(info::HandlerType::FrameworkProxy, handler_started.elapsed());
+            if let Ok((status, _)) = &outcome {
+                if *status >= 400 {
+                    stats.record_issue(
+                        info::IssueKind::FrameworkProxyError,
+                        &decoded,
+                        &format!("upstream returned status {status}"),
+                        &request.method,
+                        &target.upstream,
+                        *status,
+                        request.headers.get("referer").cloned(),
+                    );
+                }
+            }
+            return outcome;
         }
     }
 
@@ -631,6 +712,19 @@ fn handle_request(
     // Phase 2: legacy `Order`/`Allow`/`Deny` access control, against the
     // possibly-rewritten target.
     if !htaccess::access_allowed(&rules, remote_ip) {
+        stats.record_handler(info::HandlerType::HtaccessDenied, handler_started.elapsed());
+        stats.record_issue(
+            info::IssueKind::AccessControlDenial,
+            &decoded,
+            "denied by Order/Allow/Deny",
+            &request.method,
+            base_dir
+                .join(decoded.trim_start_matches('/'))
+                .to_string_lossy()
+                .as_ref(),
+            403,
+            request.headers.get("referer").cloned(),
+        );
         return respond_with_error_document(
             stream, 403, request, opts, keep_alive, base_dir, &rules,
         );
@@ -688,6 +782,22 @@ fn handle_request(
             }
             Some(user) => {
                 if !htaccess::is_authorized(&rules, &user) {
+                    stats.record_handler(
+                        info::HandlerType::HtaccessDenied,
+                        handler_started.elapsed(),
+                    );
+                    stats.record_issue(
+                        info::IssueKind::AccessControlDenial,
+                        &decoded,
+                        &format!("user {user} not authorized (Require)"),
+                        &request.method,
+                        base_dir
+                            .join(decoded.trim_start_matches('/'))
+                            .to_string_lossy()
+                            .as_ref(),
+                        403,
+                        request.headers.get("referer").cloned(),
+                    );
                     return respond_with_error_document(
                         stream, 403, request, opts, keep_alive, base_dir, &rules,
                     );
@@ -704,6 +814,16 @@ fn handle_request(
     };
 
     if rules.follow_symlinks == Some(false) && path_contains_symlink(base_dir, &candidate) {
+        stats.record_handler(info::HandlerType::HtaccessDenied, handler_started.elapsed());
+        stats.record_issue(
+            info::IssueKind::AccessControlDenial,
+            &decoded,
+            "denied by Options -FollowSymLinks",
+            &request.method,
+            candidate.to_string_lossy().as_ref(),
+            403,
+            request.headers.get("referer").cloned(),
+        );
         return respond_with_error_document(
             stream, 403, request, opts, keep_alive, base_dir, &rules,
         );
@@ -712,6 +832,16 @@ fn handle_request(
     let resolved = match candidate.canonicalize() {
         Ok(p) if p == base_dir || p.starts_with(base_dir) => p,
         _ => {
+            stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
+            stats.record_issue(
+                info::IssueKind::BrokenStaticRef,
+                &decoded,
+                "404 not found",
+                &request.method,
+                candidate.to_string_lossy().as_ref(),
+                404,
+                request.headers.get("referer").cloned(),
+            );
             return respond_with_error_document(
                 stream, 404, request, opts, keep_alive, base_dir, &rules,
             );
@@ -730,7 +860,8 @@ fn handle_request(
             let candidate_index = resolved.join(index);
             if candidate_index.is_file() {
                 if let Some(route) = classify_script(base_dir, &candidate_index, opts) {
-                    return dispatch_script(
+                    let handler = handler_type_for_route(base_dir, &candidate_index);
+                    let outcome = dispatch_script(
                         stream,
                         base_dir,
                         &candidate_index,
@@ -741,9 +872,12 @@ fn handle_request(
                         client,
                         head_only,
                         keep_alive,
+                        stats,
                     );
+                    stats.record_handler(handler, handler_started.elapsed());
+                    return outcome;
                 }
-                return serve_file(
+                let outcome = serve_file(
                     stream,
                     &candidate_index,
                     request,
@@ -751,24 +885,36 @@ fn handle_request(
                     head_only,
                     keep_alive,
                 );
+                stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
+                return outcome;
             }
         }
         // `Options Indexes`/`-Indexes` merges with/overrides the config-file
         // `directory_listing` setting for this subtree (IDEA.md "Options").
         if rules.indexes.unwrap_or(opts.directory_listing) {
-            return serve_directory_listing(
+            let outcome = serve_directory_listing(
                 stream, base_dir, &resolved, raw_path, head_only, keep_alive,
             );
+            stats.record_handler(
+                info::HandlerType::DirectoryListing,
+                handler_started.elapsed(),
+            );
+            return outcome;
         }
+        stats.record_handler(info::HandlerType::HtaccessDenied, handler_started.elapsed());
         return respond_with_error_document(
             stream, 403, request, opts, keep_alive, base_dir, &rules,
         );
     }
 
     if let Some(route) = classify_script(base_dir, &resolved, opts) {
-        return dispatch_script(
-            stream, base_dir, &resolved, &route, request, opts, body, client, head_only, keep_alive,
+        let handler = handler_type_for_route(base_dir, &resolved);
+        let outcome = dispatch_script(
+            stream, base_dir, &resolved, &route, request, opts, body, client, head_only,
+            keep_alive, stats,
         );
+        stats.record_handler(handler, handler_started.elapsed());
+        return outcome;
     }
 
     if request.method != "GET" && request.method != "HEAD" {
@@ -776,7 +922,25 @@ fn handle_request(
             stream, 405, request, opts, keep_alive, base_dir, &rules,
         );
     }
-    serve_file(stream, &resolved, request, opts, head_only, keep_alive)
+    let outcome = serve_file(stream, &resolved, request, opts, head_only, keep_alive);
+    stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
+    outcome
+}
+
+/// Distinguishes IDEA.md's two script-handler-type dashboard buckets
+/// (`cgi-bin/` vs generic `script/CGI`) for an already-classified script
+/// route, without changing `classify_script`'s return type.
+fn handler_type_for_route(base_dir: &Path, resolved: &Path) -> info::HandlerType {
+    if resolved
+        .strip_prefix(base_dir)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .is_some_and(|c| c.as_os_str() == "cgi-bin")
+    {
+        info::HandlerType::CgiBin
+    } else {
+        info::HandlerType::ScriptCgi
+    }
 }
 
 /// Which of the two CGI 1.1 execution paths (IDEA.md "Multi-language script
@@ -902,14 +1066,31 @@ fn parse_cgi_output(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
 
 /// Renders a 500 with the script/CGI execution's own server-side failure
 /// detail folded in under `--debug` (IDEA.md "Debug/error forwarding" —
-/// only used when the script produced no usable output at all).
+/// only used when the script produced no usable output at all). Also
+/// records a `ScriptFailure` issue on the dashboard with the full captured
+/// `detail` (which already includes captured stderr where available), per
+/// IDEA.md "`/server-info` diagnostics dashboard" — "full captured stderr
+/// for CGI failures".
+#[allow(clippy::too_many_arguments)]
 fn respond_script_failure(
     stream: &mut Conn,
     request: &Request,
     opts: &ServeOptions,
     keep_alive: bool,
     detail: &str,
+    stats: &info::Stats,
+    decoded_path: &str,
+    script_path: &Path,
 ) -> std::io::Result<(u16, u64)> {
+    stats.record_issue(
+        info::IssueKind::ScriptFailure,
+        decoded_path,
+        detail,
+        &request.method,
+        script_path.to_string_lossy().as_ref(),
+        500,
+        request.headers.get("referer").cloned(),
+    );
     let body = error_page_with_trace(500, request, opts.debug, Some(detail));
     let head_only = request.method == "HEAD";
     write_response(
@@ -944,8 +1125,11 @@ fn dispatch_script(
     client: &str,
     head_only: bool,
     keep_alive: bool,
+    stats: &info::Stats,
 ) -> std::io::Result<(u16, u64)> {
     use std::process::{Command, Stdio};
+
+    let decoded_path = percent_decode(request.path.split('?').next().unwrap_or("/"));
 
     let (program, fixed_args) = match route {
         ScriptRoute::ExecDirect => {
@@ -960,6 +1144,9 @@ fn dispatch_script(
                          their own executable bit and shebang/native binary)",
                         script_path.display()
                     ),
+                    stats,
+                    &decoded_path,
+                    script_path,
                 );
             }
             (script_path.to_path_buf(), Vec::new())
@@ -975,6 +1162,9 @@ fn dispatch_script(
                         opts,
                         keep_alive,
                         "script_handlers entry resolved to an empty command",
+                        stats,
+                        &decoded_path,
+                        script_path,
                     );
                 }
             };
@@ -983,6 +1173,15 @@ fn dispatch_script(
                 Some(p) => (p, fixed_args),
                 None => {
                     let msg = format!("{bin} is not installed");
+                    stats.record_issue(
+                        info::IssueKind::MissingInterpreter,
+                        &decoded_path,
+                        &msg,
+                        &request.method,
+                        script_path.to_string_lossy().as_ref(),
+                        503,
+                        request.headers.get("referer").cloned(),
+                    );
                     return write_response(
                         stream,
                         503,
@@ -1074,6 +1273,9 @@ fn dispatch_script(
                 opts,
                 keep_alive,
                 &format!("failed to start {}: {err}", program.display()),
+                stats,
+                &decoded_path,
+                script_path,
             );
         }
     };
@@ -1105,7 +1307,16 @@ fn dispatch_script(
             Err(err) => format!("failed to wait on {}: {err}", program.display()),
             Ok(_) => String::from_utf8_lossy(&stderr_buf).to_string(),
         };
-        return respond_script_failure(stream, request, opts, keep_alive, &detail);
+        return respond_script_failure(
+            stream,
+            request,
+            opts,
+            keep_alive,
+            &detail,
+            stats,
+            &decoded_path,
+            script_path,
+        );
     }
 
     let (headers, cgi_body) = parse_cgi_output(&stdout_buf);
@@ -1831,7 +2042,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base_dir = opts.base_dir.clone();
         let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let count = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(info::Stats::new("test"));
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             serve_connection(
@@ -1840,7 +2051,7 @@ mod tests {
                 &opts,
                 &logger,
                 "127.0.0.1:1",
-                &count,
+                &stats,
                 &None,
             )
             .unwrap();
@@ -1901,6 +2112,20 @@ mod tests {
         assert!(response.contains("ETag:"));
         assert!(response.contains("Content-Type: text/plain"));
         assert!(response.ends_with("hi there"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn server_info_dashboard_is_served_end_to_end() {
+        let dir = unique_dir("server-info");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /server-info HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/html"));
+        assert!(response.contains("cashttpd /server-info"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2261,7 +2486,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let count = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(info::Stats::new("test"));
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             serve_connection(
@@ -2270,7 +2495,7 @@ mod tests {
                 &opts,
                 &logger,
                 "127.0.0.1:1",
-                &count,
+                &stats,
                 &None,
             )
             .unwrap();

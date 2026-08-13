@@ -32,6 +32,30 @@ pub fn drop_privileges_if_root() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Honestly-scoped, human-readable summary of what cashttpd actually does
+/// (and does not) to contain a served request, for display on the
+/// `/server-info` dashboard (IDEA.md "`/server-info` diagnostics dashboard"
+/// — "sandboxing/child-lifecycle posture"). Only describes capability that
+/// genuinely exists elsewhere in this codebase (`drop_privileges_if_root`)
+/// — never overstates protection that isn't implemented, such as
+/// process-tree isolation, cgroup/rlimit containment, or a seccomp filter,
+/// none of which cashttpd currently applies to spawned CGI/script children
+/// or the framework dev-server child process.
+#[cfg(unix)]
+pub fn sandboxing_posture() -> &'static str {
+    "privilege drop only (root, if started as root, drops to the dedicated \
+     cashttpd service user/group after binding); no process-tree isolation, \
+     cgroup/rlimit containment, or seccomp filtering is applied to spawned \
+     CGI/script or framework dev-server child processes"
+}
+
+#[cfg(not(unix))]
+pub fn sandboxing_posture() -> &'static str {
+    "no privilege drop or process containment on this platform; CGI/script \
+     and framework dev-server child processes run with the same privileges \
+     as cashttpd itself"
+}
+
 /// Ensure `SERVICE_USER`'s system user/group exist, creating them via
 /// direct `/etc/passwd` / `/etc/group` entries if missing (the runtime
 /// image ships no `useradd`/`adduser` binary — see AI.md PART 5 "Container
@@ -207,6 +231,16 @@ pub mod paths {
             assert_ne!(c, d);
             assert_ne!(d, l);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandboxing_posture_is_non_empty() {
+        assert!(!sandboxing_posture().is_empty());
     }
 }
 
