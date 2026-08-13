@@ -21,8 +21,14 @@ test:
 coverage:
   stage: test
   script:
-    # IDEA.md does not declare a coverage threshold, so the PART 8 default of 60% applies.
-    - cargo tarpaulin --workspace --all-features --fail-under 60
+    # IDEA.md does not declare a coverage threshold, so the PART 8 default
+    # of 60% applies. Using `cargo llvm-cov` rather than `cargo tarpaulin`
+    # — both are pre-installed in casjaysdev/rust:latest and AI.md PART 8
+    # permits either, but tarpaulin's ptrace-based instrumentation needs to
+    # disable ASLR via `personality()`, which fails with EPERM inside a
+    # containerized CI job (confirmed on GitHub Actions; llvm-cov avoids the
+    # risk entirely via source-based instrumentation, kept consistent here).
+    - cargo llvm-cov --workspace --all-features --fail-under-lines 60
 
 docs:
   stage: test
@@ -35,12 +41,16 @@ license-compliance:
   services:
     - docker:dind
   script:
-    - docker run --rm -v "$PWD":/work -w /work casjaysdev/rust:latest cargo deny check licenses advisories bans sources
+    # `casjaysdev/rust:latest` ships a default ENTRYPOINT (an unrelated
+    # SMTP-config startup script) that silently intercepts any ad hoc
+    # `docker run` that doesn't explicitly override it — confirmed via a
+    # real GitHub Actions CI run. `--entrypoint sh -c '...'` bypasses it.
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo deny check licenses advisories bans sources'
     # `cargo-about` is not part of casjaysdev/rust:latest (verified directly
     # against the image), so this builds the local extension image
     # (docker/Dockerfile.build) to run the attribution-drift check.
     - docker build -f docker/Dockerfile.build -t "$CI_REGISTRY_IMAGE/toolchain:ci" .
-    - docker run --rm -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:ci" cargo about generate about.hbs > LICENSE.generated.md
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:ci" -c 'cargo about generate about.hbs' > LICENSE.generated.md
     - sed -n '/<!-- GENERATED:/,$p' LICENSE.md > LICENSE.committed-generated.md
     - diff LICENSE.committed-generated.md LICENSE.generated.md
 
@@ -61,7 +71,11 @@ workflow-policy:
   stage: security
   script:
     - set -eo pipefail
-    - 'bad=$(grep -RhnE "^\s*uses:\s*[^@]+@(v?[0-9]|main|master)" .github/ .gitea/ .forgejo/ 2>/dev/null || true)'
+    # `@(v?[0-9]|main|master)` also matches a real 40-char SHA that happens to
+    # start with a decimal digit (e.g. `@76071ef0...`), producing false
+    # positives — confirmed via a real CI run. Extract each `uses:` ref and
+    # reject only refs that are NOT a full 40-char hex SHA.
+    - 'bad=$(grep -RhnoE "^\s*uses:\s*[^@]+@[^[:space:]]+" .github/ .gitea/ .forgejo/ 2>/dev/null | grep -vE "@[0-9a-fA-F]{40}$" || true)'
     - |
       if [[ -n "$bad" ]]; then
         echo "Unpinned actions found (must be 40-char SHAs):"
@@ -78,7 +92,8 @@ vuln-scan:
     - exists:
         - Cargo.lock
   script:
-    - docker run --rm -v "$PWD":/work -w /work casjaysdev/rust:latest cargo audit
+    # Same default-ENTRYPOINT interception issue as license-compliance above.
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo audit'
 
 image-scan:
   stage: security
@@ -141,7 +156,8 @@ release-sbom:
     - docker:dind
   script:
     - docker build -f docker/Dockerfile.build -t "$CI_REGISTRY_IMAGE/toolchain:release" .
-    - docker run --rm -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:release" cargo cyclonedx --format json
+    # toolchain:release is FROM casjaysdev/rust:latest — same ENTRYPOINT fix.
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:release" -c 'cargo cyclonedx --format json'
     - cp bom.json "binaries/cashttpd-bom.json"
   artifacts:
     paths:

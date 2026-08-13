@@ -125,9 +125,13 @@ jobs:
         # inline — see that file's header comment for the full rationale.
         run: |
           docker build -f docker/Dockerfile.build -t cashttpd-toolchain:release .
+          # cashttpd-toolchain:release is FROM casjaysdev/rust:latest, so it
+          # inherits the same default-ENTRYPOINT interception issue — see the
+          # identical fix and rationale in ci.yml's license-compliance job.
           docker run --rm \
             --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
-            -v "$PWD":/work -w /work cashttpd-toolchain:release cargo cyclonedx --format json
+            --entrypoint sh \
+            -v "$PWD":/work -w /work cashttpd-toolchain:release -c 'cargo cyclonedx --format json'
           cp bom.json "binaries/cashttpd-bom.json"
 
       - name: Create GitHub release

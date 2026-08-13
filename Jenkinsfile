@@ -49,8 +49,14 @@ pipeline {
                     }
                     steps {
                         // IDEA.md does not declare a coverage threshold, so the
-                        // PART 8 default of 60% applies.
-                        sh 'cargo tarpaulin --workspace --all-features --fail-under 60'
+                        // PART 8 default of 60% applies. Using `cargo llvm-cov`
+                        // rather than `cargo tarpaulin` — both are pre-installed
+                        // and AI.md PART 8 permits either, but tarpaulin's
+                        // ptrace-based instrumentation needs `personality()` to
+                        // disable ASLR, which fails with EPERM inside a
+                        // containerized CI job (confirmed on GitHub Actions;
+                        // llvm-cov avoids the risk entirely, kept consistent here).
+                        sh 'cargo llvm-cov --workspace --all-features --fail-under-lines 60'
                     }
                 }
                 stage('Docs') {
@@ -66,6 +72,13 @@ pipeline {
                         docker { image "${RUST_IMAGE}"; reuseNode true }
                     }
                     steps {
+                        // This step runs inside the RUST_IMAGE docker agent (see
+                        // this stage's `agent` block above), which already
+                        // overrides the container ENTRYPOINT via Jenkins'
+                        // docker-pipeline plugin, so no explicit `--entrypoint`
+                        // override is needed here (unlike the ad hoc `docker run`
+                        // calls below, which run outside any `agent { docker }`
+                        // context and DO need the override).
                         sh 'cargo deny check licenses advisories bans sources'
                         // `cargo-about` is not part of casjaysdev/rust:latest
                         // (verified directly against the image), so this
@@ -73,7 +86,11 @@ pipeline {
                         // (docker/Dockerfile.build) to run the
                         // attribution-drift check.
                         sh 'docker build -f docker/Dockerfile.build -t cashttpd-toolchain:ci .'
-                        sh 'docker run --rm -v "$PWD":/work -w /work cashttpd-toolchain:ci cargo about generate about.hbs > LICENSE.generated.md'
+                        // cashttpd-toolchain:ci is FROM casjaysdev/rust:latest, whose
+                        // default ENTRYPOINT (an unrelated SMTP-config script)
+                        // silently intercepts ad hoc `docker run` invocations unless
+                        // overridden — confirmed via a real GitHub Actions CI run.
+                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work cashttpd-toolchain:ci -c "cargo about generate about.hbs" > LICENSE.generated.md'
                         sh "sed -n '/<!-- GENERATED:/,\$p' LICENSE.md > LICENSE.committed-generated.md"
                         sh 'diff LICENSE.committed-generated.md LICENSE.generated.md'
                     }
@@ -94,9 +111,14 @@ pipeline {
                 }
                 stage('Workflow Policy') {
                     steps {
+                        // `@(v?[0-9]|main|master)` also matches a real 40-char SHA
+                        // that happens to start with a decimal digit, producing
+                        // false positives — confirmed via a real CI run. Extract
+                        // each `uses:` ref and reject only refs that are NOT a
+                        // full 40-char hex SHA.
                         sh '''
                             set -eo pipefail
-                            bad=$(grep -RhnE '^\\s*uses:\\s*[^@]+@(v?[0-9]|main|master)' .github/ .gitea/ .forgejo/ 2>/dev/null || true)
+                            bad=$(grep -RhnoE '^\\s*uses:\\s*[^@]+@[^[:space:]]+' .github/ .gitea/ .forgejo/ 2>/dev/null | grep -vE '@[0-9a-fA-F]{40}$' || true)
                             if [ -n "$bad" ]; then
                               echo "Unpinned actions found (must be 40-char SHAs):"
                               echo "$bad"
@@ -185,7 +207,9 @@ pipeline {
                     }
                     steps {
                         sh 'docker build -f docker/Dockerfile.build -t cashttpd-toolchain:release .'
-                        sh 'docker run --rm -v "$PWD":/work -w /work cashttpd-toolchain:release cargo cyclonedx --format json'
+                        // Same default-ENTRYPOINT interception issue as the
+                        // License Compliance stage above — see its comment.
+                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work cashttpd-toolchain:release -c "cargo cyclonedx --format json"'
                         sh 'cp bom.json binaries/cashttpd-bom.json'
                         archiveArtifacts artifacts: 'binaries/cashttpd-bom.json', fingerprint: true
                     }
