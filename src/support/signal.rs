@@ -16,7 +16,7 @@
 //! registration and the shutdown-flag state machine only.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -29,11 +29,30 @@ use signal_hook::flag;
 #[derive(Clone)]
 pub struct ShutdownState {
     shutdown_requested: Arc<AtomicBool>,
+    child_pid: Arc<AtomicI32>,
 }
 
 impl ShutdownState {
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// Records the PID of a framework dev-server child process (IDEA.md
+    /// "Framework dev-server proxying" — "no orphaned processes left
+    /// running after cashttpd exits, under any exit path") so the raw
+    /// signal handler installed by `install_handlers` can terminate it on
+    /// *every* delivery of SIGINT/SIGTERM/SIGHUP, including the "second
+    /// signal forces an immediate exit" path, which bypasses ordinary
+    /// `Drop`-based cleanup entirely.
+    pub fn track_child_process(&self, pid: u32) {
+        self.child_pid.store(pid as i32, Ordering::SeqCst);
+    }
+
+    /// Clears the tracked child PID once the caller has already killed and
+    /// reaped it itself on the ordinary graceful-shutdown path, so a late
+    /// signal delivered after that point never signals a stale/reused PID.
+    pub fn clear_child_process(&self) {
+        self.child_pid.store(0, Ordering::SeqCst);
     }
 }
 
@@ -56,13 +75,39 @@ impl ShutdownState {
 ///    the pre-delivery value, never the value this same delivery just set.
 pub fn install_handlers() -> std::io::Result<ShutdownState> {
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let child_pid = Arc::new(AtomicI32::new(0));
 
     for sig in [SIGINT, SIGTERM, SIGHUP] {
+        // Registered first so it runs on *every* delivery of this signal —
+        // including the very first one. A tracked framework dev-server
+        // child (see `ShutdownState::track_child_process`) can't wait for
+        // the graceful drain loop to notice `shutdown_requested`, because a
+        // *second* delivery below terminates the process immediately via
+        // `flag::register_conditional_shutdown`, which never runs ordinary
+        // `Drop` cleanup.
+        let pid_for_handler = Arc::clone(&child_pid);
+        // SAFETY: the closure only loads an `AtomicI32` and, if non-zero,
+        // calls `kill(2)` via `nix` — both are async-signal-safe operations
+        // with no allocation, locking, or panicking path.
+        unsafe {
+            signal_hook::low_level::register(sig, move || {
+                let pid = pid_for_handler.load(Ordering::SeqCst);
+                if pid > 0 {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                }
+            })?;
+        }
         flag::register_conditional_shutdown(sig, 1, Arc::clone(&shutdown_requested))?;
         flag::register(sig, Arc::clone(&shutdown_requested))?;
     }
 
-    Ok(ShutdownState { shutdown_requested })
+    Ok(ShutdownState {
+        shutdown_requested,
+        child_pid,
+    })
 }
 
 #[cfg(test)]
@@ -73,7 +118,20 @@ mod tests {
     fn fresh_state_has_no_shutdown_requested() {
         let state = ShutdownState {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            child_pid: Arc::new(AtomicI32::new(0)),
         };
         assert!(!state.is_shutdown_requested());
+    }
+
+    #[test]
+    fn track_and_clear_child_process_round_trips() {
+        let state = ShutdownState {
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            child_pid: Arc::new(AtomicI32::new(0)),
+        };
+        state.track_child_process(4242);
+        assert_eq!(state.child_pid.load(Ordering::SeqCst), 4242);
+        state.clear_child_process();
+        assert_eq!(state.child_pid.load(Ordering::SeqCst), 0);
     }
 }

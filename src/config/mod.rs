@@ -169,7 +169,6 @@ pub struct Resolved {
     pub directory_listing: bool,
     pub mime_types: BTreeMap<String, String>,
     pub script_handlers: BTreeMap<String, Option<String>>,
-    #[allow(dead_code)]
     pub proxy: ProxyLayer,
     #[allow(dead_code)]
     pub logging_access_format: String,

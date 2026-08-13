@@ -33,8 +33,6 @@ otherwise always relayed as-is, never intercepted. Still open:
 - PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
   full script path to exist as a literal file/dir and does not yet split a
   trailing extra path segment off after the script name.
-- Framework dev-server proxying (`proxy.*` config keys are parsed/resolved
-  but never consulted by `run()`/`handle_request()`).
 - `/server-info` diagnostics dashboard.
 - Live config-file reload (rebind on listen/port/tls change without
   restart) — `crate::config::load` is only called once, at `serve` startup.
@@ -102,6 +100,54 @@ port-80 reachability) — the client is implemented in full per RFC 8555
 and falls back safely on failure, but genuine issuance against Let's
 Encrypt's production or staging endpoints is a manual-verification-only
 gap, not a stub.
+
+Framework dev-server proxying is now implemented in `src/server/proxy.rs`
+(IDEA.md "Framework dev-server proxying"): `resolve_proxy_target` layers
+the resolved `proxy.*` config over a built-in profile table (`vite`,
+`bun`, `deno`, `node`, `rails`, `django`, `flask`, `fastapi`), each with a
+default spawn command/upstream address/path scope, auto-detected from
+marker files in `base_dir` (`vite.config.*`/`package.json` "vite" dep,
+`bun.lockb`, `deno.json[c]`, `package.json` `dev`/`start` script,
+`Gemfile`+`config.ru`, `manage.py`, `pyproject.toml`/`requirements.txt`
+mentioning `fastapi`/`flask`) when `proxy.type` is not set explicitly.
+`enabled: false` always disables proxying regardless of any marker file
+present; `type` alone reuses that profile's other defaults;
+`command`/`upstream`/`path_prefix` each independently override the
+selected profile's corresponding default; a fully explicit
+`command`+`upstream` pair needs no `type` at all (`kind` then reports as
+`"custom"`). `run()` spawns the resolved framework's child process once
+at startup (never per-request) and hands its PID to
+`support::signal::ShutdownState::track_child_process`, so a raw
+`signal_hook::low_level::register` handler kills it on every
+SIGINT/SIGTERM/SIGHUP delivery, including the "second signal forces an
+immediate exit" escape hatch that bypasses ordinary `Drop`-based cleanup;
+it is also killed and reaped on the ordinary graceful-shutdown path.
+`handle_request` dispatches a request whose decoded path starts with
+`path_prefix` to `proxy::proxy_request` ahead of the static/CGI/
+`.htaccess` pipeline: until a bounded `TcpStream::connect_timeout`
+readiness probe (the one timeout IDEA.md's "no artificial limits" policy
+explicitly carves out) succeeds, the client receives an embedded
+auto-refreshing dark-theme "starting…" page matching the existing error
+page styling; once ready, every request header is forwarded verbatim
+(`Host` unmodified, hop-by-hop `Connection` dropped and replaced),
+`X-Forwarded-For`/`X-Forwarded-Proto` are appended to (never overwriting)
+any existing value, and the response is relayed to the client honoring
+the upstream's own framing (`Content-Length`, `Transfer-Encoding:
+chunked`, or read-until-close) via true chunk-by-chunk streaming, not
+full in-memory buffering. A `Connection: Upgrade`/`Upgrade: websocket`
+request that receives a `101 Switching Protocols` response is relayed
+bidirectionally after the handshake (RFC 6455) via a single-thread
+short-timeout poll loop, chosen over one-thread-per-direction because the
+TLS `Conn` variant cannot safely hand out two simultaneous `&mut`
+handles across threads. Documented gap: exercising a live framework
+dev-server child process (actually spawning `npm run dev`/`bundle exec
+rails server`/etc. and proxying real traffic through it end-to-end)
+cannot be run in this sandboxed dev/CI environment (no framework
+toolchains installed, no guaranteed free upstream ports) — detection,
+resolution precedence, header forwarding, and the WebSocket upgrade path
+are covered by unit tests against real loopback sockets, but genuine
+end-to-end proxying against a real framework process is a
+manual-verification-only gap, not a stub.
 
 Scheduled log rotation/retention is now implemented in
 `src/support/rotation.rs` (`daily`/`weekly`/`monthly`/`yearly`, `NMB`/`NGB`,

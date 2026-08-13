@@ -18,9 +18,14 @@
 //! Indexes`/`FollowSymLinks`, and `RewriteEngine`/`RewriteRule`/`Redirect`/
 //! `RedirectMatch`, applied per the documented 6-phase per-request order.
 //!
+//! Also implements framework dev-server proxying (`server::proxy`, IDEA.md
+//! "Framework dev-server proxying"): auto-detected or explicitly configured
+//! requests under a `path_prefix` are relayed to a spawned dev-server child
+//! process, streamed both ways, with WebSocket/`Upgrade` support.
+//!
 //! Still open (tracked in TODO.AI.md): chunked *request* body decoding
-//! (`Content-Length` only), TLS, framework dev-server proxying, the
-//! `/server-info` dashboard, and live config reload.
+//! (`Content-Length` only), the `/server-info` dashboard, and live config
+//! reload.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -33,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::support::signal;
 
 mod htaccess;
+mod proxy;
 mod tls;
 
 use tls::Conn;
@@ -227,6 +233,28 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
     let request_count = Arc::new(AtomicU64::new(0));
     let started_at = Instant::now();
 
+    // Framework dev-server proxying (IDEA.md "Framework dev-server
+    // proxying") — resolved and spawned once here, never per-request. The
+    // child's PID is handed to `shutdown` so every signal-driven exit path
+    // (including the "second signal forces an immediate exit" one) kills
+    // it, not just the graceful path below.
+    let proxy_target = proxy::resolve_proxy_target(&base_dir, &opts.proxy).map(Arc::new);
+    let mut proxy_child = None;
+    if let Some(target) = &proxy_target {
+        match proxy::spawn_child(target, &base_dir) {
+            Ok(child) => {
+                shutdown.track_child_process(child.id());
+                proxy_child = Some(child);
+            }
+            Err(err) => {
+                logger.error(&format!(
+                    "failed to start framework dev-server ({} : {}): {err}",
+                    target.kind, target.command
+                ));
+            }
+        }
+    }
+
     while !shutdown.is_shutdown_requested() {
         match listener.accept() {
             Ok((stream, addr)) => {
@@ -235,6 +263,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
                 let opts = Arc::clone(&opts);
                 let logger = Arc::clone(&logger);
                 let tls_config = tls_config.clone();
+                let proxy_target = proxy_target.clone();
                 std::thread::spawn(move || {
                     let conn = match tls_config {
                         Some(config) => match rustls::ServerConnection::new(config) {
@@ -256,6 +285,7 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
                         &logger,
                         &addr.to_string(),
                         &request_count,
+                        &proxy_target,
                     ) {
                         logger.error(&format!("connection error from {addr}: {err}"));
                     }
@@ -269,6 +299,17 @@ pub fn run(opts: ServeOptions, quiet: bool) -> std::io::Result<()> {
             }
         }
     }
+
+    // Ordinary graceful-shutdown path: kill and reap the framework
+    // dev-server child directly (the signal handler above already sent it
+    // SIGTERM on the signal that broke this loop, but that's fire-and-
+    // forget — this makes sure it's actually gone and not a zombie before
+    // cashttpd itself exits).
+    if let Some(mut child) = proxy_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    shutdown.clear_child_process();
 
     println!(
         "cashttpd: graceful shutdown complete after {}, served {} requests",
@@ -327,6 +368,7 @@ fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Option<Request>> 
 
 /// Serves every keep-alive request on one connection (RFC 9112 §9.3 —
 /// HTTP/1.1 connections are persistent unless `Connection: close` is sent).
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     conn: Conn,
     base_dir: &Path,
@@ -334,6 +376,7 @@ fn serve_connection(
     logger: &Logger,
     client: &str,
     request_count: &AtomicU64,
+    proxy_target: &Option<Arc<proxy::ProxyTarget>>,
 ) -> std::io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(conn);
@@ -373,6 +416,7 @@ fn serve_connection(
             &body,
             client,
             keep_alive,
+            proxy_target,
         );
         let (status, bytes) = match outcome {
             Ok(v) => v,
@@ -521,6 +565,7 @@ fn handle_request(
     body: &[u8],
     client: &str,
     keep_alive: bool,
+    proxy_target: &Option<Arc<proxy::ProxyTarget>>,
 ) -> std::io::Result<(u16, u64)> {
     let head_only = request.method == "HEAD";
     let known_method = matches!(
@@ -540,6 +585,16 @@ fn handle_request(
     }
 
     let remote_ip = client.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(client);
+
+    // Framework dev-server proxying (IDEA.md "Framework dev-server
+    // proxying") — a request under `path_prefix` is relayed to the
+    // upstream dev server entirely in place of cashttpd's own static/CGI/
+    // `.htaccess` pipeline below; everything else still goes through it.
+    if let Some(target) = proxy_target {
+        if decoded.starts_with(target.path_prefix.as_str()) {
+            return proxy::proxy_request(stream, target, request, body, client, opts, keep_alive);
+        }
+    }
 
     // Phase 1 (IDEA.md 6-phase evaluation order): rewrite/redirect first,
     // it can change the target path/resource before anything else runs.
@@ -1786,6 +1841,7 @@ mod tests {
                 &logger,
                 "127.0.0.1:1",
                 &count,
+                &None,
             )
             .unwrap();
         });
@@ -2215,6 +2271,7 @@ mod tests {
                 &logger,
                 "127.0.0.1:1",
                 &count,
+                &None,
             )
             .unwrap();
         });
