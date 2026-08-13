@@ -33,3 +33,16 @@ nix         = { version = "0.29", features = ["user", "signal"] }
 # build fine under `casjaysdev/rust:latest`, verified directly).
 serde_yaml = "0.9"
 mime_guess = "2"
+# `.htpasswd` hash verification (IDEA.md ".htaccess"/".htpasswd"
+# compatibility") — bcrypt for `$2y$`/`$2a$`/`$2b$`, `md-5` as the digest
+# primitive for the custom apr1/md5-crypt loop, `sha1` + `base64` for the
+# legacy `{SHA}` format. All pure Rust (PART 5 "Pure-Rust Library Stack" —
+# RustCrypto family); crypt-DES and other legacy formats are out of scope
+# (documented gap in TODO.AI.md).
+bcrypt = "0.15"
+md-5   = "0.10"
+sha1   = "0.10"
+base64 = "0.22"
+# `RewriteRule`/`RewriteCond`/`RedirectMatch` pattern matching (IDEA.md
+# ".htaccess" `mod_rewrite`/`mod_alias` semantics).
+regex = "1"

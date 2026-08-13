@@ -33,9 +33,6 @@ otherwise always relayed as-is, never intercepted. Still open:
 - PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
   full script path to exist as a literal file/dir and does not yet split a
   trailing extra path segment off after the script name.
-- `.htaccess`/`.htpasswd` compatibility (recursive discovery, cascade merge,
-  AuthType/Require/Order-Allow-Deny, RewriteEngine/RewriteRule, ErrorDocument,
-  DirectoryIndex, Options) — IDEA.md "`.htaccess`/`.htpasswd` compatibility".
 - TLS certificate resolution (Let's Encrypt live/new-request + self-signed
   fallback, `{data_dir}/certs/{derived_name}/` storage) — IDEA.md "TLS
   certificate resolution". `Resolved.tls_enabled` is parsed/resolved but
@@ -45,6 +42,40 @@ otherwise always relayed as-is, never intercepted. Still open:
 - `/server-info` diagnostics dashboard.
 - Live config-file reload (rebind on listen/port/tls change without
   restart) — `crate::config::load` is only called once, at `serve` startup.
+
+`.htaccess`/`.htpasswd` Apache-compatible per-directory configuration is now
+implemented in `src/server/htaccess.rs` (IDEA.md "`.htaccess`/`.htpasswd`
+compatibility"): recursive discovery from `base_dir` down to each request's
+resolved directory, root-most-to-leaf cascade merge (subdirectory
+`.htaccess` layers on top of parent directives, not replaces them),
+`AuthType Basic` + `AuthName`/`AuthUserFile`/`AuthGroupFile` authentication
+against `.htpasswd` (bcrypt `$2y$`/`$2a$`/`$2b$` via the `bcrypt` crate,
+classic `apr1`/md5crypt implemented natively against the `md-5` crate and
+verified against a known Apache test vector, legacy `{SHA}` via `sha1` +
+`base64`), `Require valid-user`/`Require user`/`Require group` plus legacy
+`Order allow,deny`/`Order deny,allow` with `Allow`/`Deny from` (IP and CIDR,
+both IPv4/IPv6), `ErrorDocument`, `DirectoryIndex`, `Options
+Indexes`/`FollowSymLinks`, and a `mod_rewrite`/`mod_alias`-compatible engine
+(`RewriteEngine`/`RewriteCond`/`RewriteRule` with `[R]`/`[R=NNN]`/`[NC]`
+flags and per-directory-relative pattern matching, `Redirect`/
+`RedirectMatch`), all wired into `server::handle_request` per the documented
+6-phase per-request evaluation order (rewrite/redirect → access control →
+authentication → authorization → directory-index/listing → ErrorDocument
+mapping for any error status from any phase). `.htaccess`/`.htpasswd`
+remain non-servable as static content at any depth (trust boundary
+unaffected, not overridable from within a `.htaccess` file). Documented
+gaps:
+- Hostname-based `Allow`/`Deny from {host}` is parsed but never matches — no
+  reverse-DNS lookup is performed.
+- `.htpasswd` `crypt`-DES and other legacy formats beyond bcrypt/apr1/`{SHA}`
+  are unsupported.
+- `RewriteCond`/`RewriteRule`/`Redirect` variable expansion covers
+  `%{REQUEST_URI}`, `%{QUERY_STRING}`, `%{HTTP_HOST}`, `%{REQUEST_METHOD}`,
+  `%{REMOTE_ADDR}` only — not the full Apache variable set.
+- Legacy `Order allow,deny`/`Order deny,allow` is implemented as the
+  commonly-documented approximation (deny-always-wins-if-matched for
+  `allow,deny`; allow-overrides-deny for `deny,allow`), not Apache's exact
+  directive-by-directive last-match-wins evaluation.
 
 Scheduled log rotation/retention is now implemented in
 `src/support/rotation.rs` (`daily`/`weekly`/`monthly`/`yearly`, `NMB`/`NGB`,

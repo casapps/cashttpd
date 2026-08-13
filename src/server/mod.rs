@@ -10,12 +10,17 @@
 //!
 //! Also implements CGI 1.1 / multi-language script execution (`cgi-bin/`
 //! exec-by-shebang and extension-based `script_handlers` interpreter
-//! dispatch) and scheduled log rotation/retention.
+//! dispatch), scheduled log rotation/retention, and `.htaccess`/`.htpasswd`
+//! Apache-compatible per-directory configuration (`server::htaccess`) —
+//! recursive discovery/cascade merge, `AuthType Basic` + bcrypt/apr1/
+//! `{SHA}` `.htpasswd` authentication, `Require`/legacy `Order`/`Allow`/
+//! `Deny` authorization, `ErrorDocument`, `DirectoryIndex`, `Options
+//! Indexes`/`FollowSymLinks`, and `RewriteEngine`/`RewriteRule`/`Redirect`/
+//! `RedirectMatch`, applied per the documented 6-phase per-request order.
 //!
 //! Still open (tracked in TODO.AI.md): chunked *request* body decoding
-//! (`Content-Length` only), `.htaccess`/`.htpasswd`, TLS, framework
-//! dev-server proxying, the `/server-info` dashboard, and live config
-//! reload.
+//! (`Content-Length` only), TLS, framework dev-server proxying, the
+//! `/server-info` dashboard, and live config reload.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -26,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::support::signal;
+
+mod htaccess;
 
 /// Effective runtime configuration for `serve` — the fully layered result
 /// of IDEA.md's "CLI flag > env var > per-project config > global config >
@@ -350,6 +357,121 @@ fn serve_connection(
     }
 }
 
+/// `.htaccess`/`.htpasswd` are never servable as static content, at any
+/// depth — non-negotiable trust boundary (IDEA.md ".htaccess"/".htpasswd"
+/// compatibility"), unaffected by (and never overridable from within) the
+/// `.htaccess` cascade itself.
+fn is_ht_path(decoded: &str) -> bool {
+    decoded.split('/').any(|seg| {
+        seg == ".htaccess" || seg == ".htpasswd" || (seg.starts_with(".ht") && seg.len() > 3)
+    })
+}
+
+/// Merges the `.htaccess` cascade rooted at `base_dir` down to the nearest
+/// existing directory containing `decoded` (IDEA.md "Discovery is
+/// recursive... including `base_dir/.htaccess` itself").
+fn htaccess_rules_for(base_dir: &Path, decoded: &str) -> htaccess::Rules {
+    let requested = decoded.trim_start_matches('/');
+    let candidate = if requested.is_empty() {
+        base_dir.to_path_buf()
+    } else {
+        base_dir.join(requested)
+    };
+    let mut dir = if candidate.is_dir() {
+        candidate
+    } else {
+        candidate
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| base_dir.to_path_buf())
+    };
+    loop {
+        if dir.is_dir() {
+            break;
+        }
+        match dir.parent() {
+            Some(p) if p == base_dir || p.starts_with(base_dir) => dir = p.to_path_buf(),
+            _ => {
+                dir = base_dir.to_path_buf();
+                break;
+            }
+        }
+    }
+    let dir = dir.canonicalize().unwrap_or(dir);
+    if dir != base_dir && !dir.starts_with(base_dir) {
+        return htaccess::Rules::default();
+    }
+    htaccess::merge_cascade(base_dir, &dir)
+}
+
+/// True when any path component between `base_dir` and `candidate` (not yet
+/// canonicalized) is itself a symlink — used to enforce `Options
+/// -FollowSymLinks`. Default-deny of escaping `base_dir` applies regardless
+/// (enforced separately via the post-`canonicalize` `starts_with` check).
+fn path_contains_symlink(base_dir: &Path, candidate: &Path) -> bool {
+    let rel = match candidate.strip_prefix(base_dir) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut cur = base_dir.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Phase 6 of the per-request evaluation order (IDEA.md "ErrorDocument
+/// mapping applies to any error status from any phase above"): serves the
+/// configured `ErrorDocument` target if one exists for `status`, else falls
+/// back to the embedded default error page.
+fn respond_with_error_document(
+    stream: &mut TcpStream,
+    status: u16,
+    request: &Request,
+    opts: &ServeOptions,
+    keep_alive: bool,
+    base_dir: &Path,
+    rules: &htaccess::Rules,
+) -> std::io::Result<(u16, u64)> {
+    let head_only = request.method == "HEAD";
+    if let Some(target) = rules.error_documents.get(&status) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            return write_response(
+                stream,
+                302,
+                "Found",
+                &[],
+                true,
+                keep_alive,
+                &[("Location".to_string(), target.clone())],
+            );
+        }
+        let rel = target.trim_start_matches('/');
+        if let Ok(resolved) = base_dir.join(rel).canonicalize() {
+            if (resolved == base_dir || resolved.starts_with(base_dir)) && resolved.is_file() {
+                if let Ok(content) = std::fs::read(&resolved) {
+                    let content_type = content_type_for(&resolved, opts);
+                    return write_response(
+                        stream,
+                        status,
+                        reason_phrase(status),
+                        &content,
+                        head_only,
+                        keep_alive,
+                        &[("Content-Type".to_string(), content_type)],
+                    );
+                }
+            }
+        }
+    }
+    respond_error(stream, status, request, opts, keep_alive)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_request(
     stream: &mut TcpStream,
@@ -370,15 +492,113 @@ fn handle_request(
     }
 
     let raw_path = request.path.split('?').next().unwrap_or("/");
-    let decoded = percent_decode(raw_path);
+    let query = request.path.split_once('?').map(|x| x.1).unwrap_or("");
+    let mut decoded = percent_decode(raw_path);
 
-    // `.htaccess`/`.htpasswd` are never servable as static content, at any
-    // depth — non-negotiable trust boundary (IDEA.md ".htaccess"/
-    // ".htpasswd" compatibility").
-    if decoded.split('/').any(|seg| {
-        seg == ".htaccess" || seg == ".htpasswd" || (seg.starts_with(".ht") && seg.len() > 3)
-    }) {
+    if is_ht_path(&decoded) {
         return respond_error(stream, 403, request, opts, keep_alive);
+    }
+
+    let remote_ip = client.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(client);
+
+    // Phase 1 (IDEA.md 6-phase evaluation order): rewrite/redirect first,
+    // it can change the target path/resource before anything else runs.
+    let mut rules = htaccess_rules_for(base_dir, &decoded);
+    match htaccess::apply_rewrites(
+        &rules,
+        &decoded,
+        query,
+        &request.method,
+        remote_ip,
+        &request.headers,
+    ) {
+        htaccess::RewriteOutcome::Redirect(status, target) => {
+            return write_response(
+                stream,
+                status,
+                reason_phrase(status),
+                &[],
+                true,
+                keep_alive,
+                &[("Location".to_string(), target)],
+            );
+        }
+        htaccess::RewriteOutcome::Rewritten(new_path) => {
+            if is_ht_path(&new_path) {
+                return respond_error(stream, 403, request, opts, keep_alive);
+            }
+            decoded = new_path;
+            rules = htaccess_rules_for(base_dir, &decoded);
+        }
+        htaccess::RewriteOutcome::Unchanged => {}
+    }
+
+    // Phase 2: legacy `Order`/`Allow`/`Deny` access control, against the
+    // possibly-rewritten target.
+    if !htaccess::access_allowed(&rules, remote_ip) {
+        return respond_with_error_document(
+            stream, 403, request, opts, keep_alive, base_dir, &rules,
+        );
+    }
+
+    // Phases 3-4: `AuthType Basic` authentication, then `Require`
+    // authorization.
+    if rules
+        .auth_type
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("basic"))
+        && rules.require_valid_user()
+    {
+        let Some(user_file) = rules.auth_user_file.clone() else {
+            return respond_with_error_document(
+                stream, 500, request, opts, keep_alive, base_dir, &rules,
+            );
+        };
+        let creds = request
+            .headers
+            .get("authorization")
+            .and_then(|h| htaccess::parse_basic_auth(h));
+        let authed_user = creds.and_then(|(user, pass)| {
+            if htaccess::verify_password(&user_file, &user, &pass) {
+                Some(user)
+            } else {
+                None
+            }
+        });
+        match authed_user {
+            None => {
+                let realm = rules
+                    .auth_name
+                    .clone()
+                    .unwrap_or_else(|| "Restricted".to_string());
+                let auth_body = error_page(401, request, opts.debug);
+                return write_response(
+                    stream,
+                    401,
+                    reason_phrase(401),
+                    auth_body.as_bytes(),
+                    head_only,
+                    keep_alive,
+                    &[
+                        (
+                            "Content-Type".to_string(),
+                            "text/html; charset=utf-8".to_string(),
+                        ),
+                        (
+                            "WWW-Authenticate".to_string(),
+                            format!("Basic realm=\"{realm}\""),
+                        ),
+                    ],
+                );
+            }
+            Some(user) => {
+                if !htaccess::is_authorized(&rules, &user) {
+                    return respond_with_error_document(
+                        stream, 403, request, opts, keep_alive, base_dir, &rules,
+                    );
+                }
+            }
+        }
     }
 
     let requested = decoded.trim_start_matches('/');
@@ -388,16 +608,30 @@ fn handle_request(
         base_dir.join(requested)
     };
 
+    if rules.follow_symlinks == Some(false) && path_contains_symlink(base_dir, &candidate) {
+        return respond_with_error_document(
+            stream, 403, request, opts, keep_alive, base_dir, &rules,
+        );
+    }
+
     let resolved = match candidate.canonicalize() {
         Ok(p) if p == base_dir || p.starts_with(base_dir) => p,
-        _ => return respond_error(stream, 404, request, opts, keep_alive),
+        _ => {
+            return respond_with_error_document(
+                stream, 404, request, opts, keep_alive, base_dir, &rules,
+            );
+        }
     };
 
     if resolved.is_dir() {
         if request.method != "GET" && request.method != "HEAD" {
-            return respond_error(stream, 405, request, opts, keep_alive);
+            return respond_with_error_document(
+                stream, 405, request, opts, keep_alive, base_dir, &rules,
+            );
         }
-        for index in ["index.html", "index.htm"] {
+        let default_index = ["index.html".to_string(), "index.htm".to_string()];
+        let index_list = rules.directory_index.as_deref().unwrap_or(&default_index);
+        for index in index_list {
             let candidate_index = resolved.join(index);
             if candidate_index.is_file() {
                 if let Some(route) = classify_script(base_dir, &candidate_index, opts) {
@@ -424,12 +658,16 @@ fn handle_request(
                 );
             }
         }
-        if opts.directory_listing {
+        // `Options Indexes`/`-Indexes` merges with/overrides the config-file
+        // `directory_listing` setting for this subtree (IDEA.md "Options").
+        if rules.indexes.unwrap_or(opts.directory_listing) {
             return serve_directory_listing(
                 stream, base_dir, &resolved, raw_path, head_only, keep_alive,
             );
         }
-        return respond_error(stream, 403, request, opts, keep_alive);
+        return respond_with_error_document(
+            stream, 403, request, opts, keep_alive, base_dir, &rules,
+        );
     }
 
     if let Some(route) = classify_script(base_dir, &resolved, opts) {
@@ -439,7 +677,9 @@ fn handle_request(
     }
 
     if request.method != "GET" && request.method != "HEAD" {
-        return respond_error(stream, 405, request, opts, keep_alive);
+        return respond_with_error_document(
+            stream, 405, request, opts, keep_alive, base_dir, &rules,
+        );
     }
     serve_file(stream, &resolved, request, opts, head_only, keep_alive)
 }
