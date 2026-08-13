@@ -25,6 +25,10 @@ allow = [
   "CC0-1.0",
   "Unlicense",
   "OpenSSL",
+  # Mozilla CA root-store data shipped by `webpki-roots` (server::tls ACME
+  # client's HTTPS trust store) — a permissive data-attribution license,
+  # not copyleft; see AI.md PART 11 "License Allowlist (default)".
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

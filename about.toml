@@ -16,6 +16,7 @@ accepted = [
   "CC0-1.0",
   "Unlicense",
   "OpenSSL",
+  "CDLA-Permissive-2.0",
 ]
 
 ignore-build-dependencies = true

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Either half of a connection this server terminates — a plain TCP socket,
@@ -160,11 +161,10 @@ fn scan_letsencrypt_live(fqdn: &str) -> Option<(PathBuf, PathBuf)> {
 }
 
 fn first_pem_cert_der(pem: &[u8]) -> Option<Vec<u8>> {
-    let mut reader = std::io::Cursor::new(pem);
-    match rustls_pemfile::certs(&mut reader).next() {
-        Some(Ok(cert)) => Some(cert.as_ref().to_vec()),
-        _ => None,
-    }
+    CertificateDer::pem_slice_iter(pem)
+        .next()?
+        .ok()
+        .map(|cert| cert.as_ref().to_vec())
 }
 
 fn load_cert_key(
@@ -172,21 +172,15 @@ fn load_cert_key(
     privkey: &Path,
 ) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_pem = std::fs::read(fullchain)?;
-    let mut reader = std::io::Cursor::new(&cert_pem);
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|c| c.into_owned())
-        .collect();
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
     if chain.is_empty() {
         return Err(io::Error::other("no certificates found in fullchain PEM"));
     }
 
     let key_pem = std::fs::read(privkey)?;
-    let mut reader = std::io::Cursor::new(&key_pem);
-    let key = rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::other("no private key found in PEM"))?
-        .clone_key();
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(io::Error::other)?;
 
     Ok((chain, key))
 }

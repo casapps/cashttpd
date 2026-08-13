@@ -50,10 +50,15 @@ regex = "1"
 # terminates HTTPS and (as a client) drives the ACME v2 HTTPS calls (PART 5
 # "Pure-Rust Library Stack" — TLS row); `webpki-roots` supplies the Mozilla
 # root store `rustls` needs to verify Let's Encrypt's own TLS certificate
-# when this server acts as an ACME client; `rcgen` generates self-signed
-# certs and ACME CSRs (pure Rust, uses `ring` internally — pre-granted per
-# PART 5); `ring` signs the ACME account/JWS requests (ECDSA P-256);
-# `serde_json` encodes/decodes ACME JSON payloads.
+# when this server acts as an ACME client; `rustls-pki-types` (the `pem`
+# object API, `alloc` feature) parses PEM cert/key files directly — used
+# instead of `rustls-pemfile`, which RUSTSEC-2025-0134 flags unmaintained
+# (its own upstream advisory recommends depending on `rustls-pki-types`
+# directly, since the latest `rustls-pemfile` release was already a thin
+# wrapper around the same code); `rcgen` generates self-signed certs and
+# ACME CSRs (pure Rust, uses `ring` internally — pre-granted per PART 5);
+# `ring` signs the ACME account/JWS requests (ECDSA P-256); `serde_json`
+# encodes/decodes ACME JSON payloads.
 #
 # The ACME v2 (RFC 8555) HTTP-01 flow's own HTTP/1.1 request/response
 # framing is hand-rolled directly on `rustls::ClientConnection` + `TcpStream`
@@ -72,13 +77,15 @@ regex = "1"
 # existing precedent (`apr1_crypt`, the `mod_rewrite` engine) of
 # implementing bounded protocol logic directly when the alternative is a
 # heavyweight dependency this toolchain cannot build anyway.
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-webpki-roots   = "0.26"
-rcgen          = "0.13"
-ring           = "0.17"
-serde_json     = "1"
+rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+webpki-roots    = "1"
+rcgen           = "0.13"
+ring            = "0.17"
+serde_json      = "1"
 # Self-signed cert validity window (`server::tls::generate_self_signed`) —
 # the non-macro subset already pulled transitively by `rcgen`, used
-# directly rather than hand-rolling yet another date type.
-time           = "0.3"
+# directly rather than hand-rolling yet another date type. Pinned >=0.3.47:
+# RUSTSEC-2026-0009 (stack exhaustion parsing malicious RFC 2822 input) is
+# fixed from 0.3.47 onward.
+time            = "0.3.47"
