@@ -8,11 +8,14 @@
 //! error pages, `.ht*` trust-boundary denial, and unconditional
 //! Apache-format access/error file logging.
 //!
-//! Still open (tracked in TODO.AI.md): chunked *request* body decoding,
-//! CGI/multi-language script execution, `.htaccess`/`.htpasswd`, TLS,
-//! framework dev-server proxying, the `/server-info` dashboard, and
-//! scheduled log rotation/retention (files are appended to unconditionally;
-//! time/size-based rollover is not yet implemented).
+//! Also implements CGI 1.1 / multi-language script execution (`cgi-bin/`
+//! exec-by-shebang and extension-based `script_handlers` interpreter
+//! dispatch) and scheduled log rotation/retention.
+//!
+//! Still open (tracked in TODO.AI.md): chunked *request* body decoding
+//! (`Content-Length` only), `.htaccess`/`.htpasswd`, TLS, framework
+//! dev-server proxying, the `/server-info` dashboard, and live config
+//! reload.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -302,7 +305,28 @@ fn serve_connection(
             .map(|v| !v.eq_ignore_ascii_case("close"))
             .unwrap_or_else(|| request.version == "HTTP/1.1");
 
-        let outcome = handle_request(&mut writer, base_dir, opts, &request, keep_alive);
+        // No artificial resource limits (IDEA.md "Security" — a script/CGI
+        // request body is read in full per its own `Content-Length`, never
+        // capped or streamed with a server-imposed ceiling).
+        let content_length: usize = request
+            .headers
+            .get("content-length")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            return Ok(());
+        }
+
+        let outcome = handle_request(
+            &mut writer,
+            base_dir,
+            opts,
+            &request,
+            &body,
+            client,
+            keep_alive,
+        );
         let (status, bytes) = match outcome {
             Ok(v) => v,
             Err(err) => {
@@ -326,15 +350,22 @@ fn serve_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     stream: &mut TcpStream,
     base_dir: &Path,
     opts: &ServeOptions,
     request: &Request,
+    body: &[u8],
+    client: &str,
     keep_alive: bool,
 ) -> std::io::Result<(u16, u64)> {
     let head_only = request.method == "HEAD";
-    if request.method != "GET" && request.method != "HEAD" {
+    let known_method = matches!(
+        request.method.as_str(),
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
+    );
+    if !known_method {
         return respond_error(stream, 405, request, opts, keep_alive);
     }
 
@@ -363,9 +394,26 @@ fn handle_request(
     };
 
     if resolved.is_dir() {
+        if request.method != "GET" && request.method != "HEAD" {
+            return respond_error(stream, 405, request, opts, keep_alive);
+        }
         for index in ["index.html", "index.htm"] {
             let candidate_index = resolved.join(index);
             if candidate_index.is_file() {
+                if let Some(route) = classify_script(base_dir, &candidate_index, opts) {
+                    return dispatch_script(
+                        stream,
+                        base_dir,
+                        &candidate_index,
+                        &route,
+                        request,
+                        opts,
+                        body,
+                        client,
+                        head_only,
+                        keep_alive,
+                    );
+                }
                 return serve_file(
                     stream,
                     &candidate_index,
@@ -384,7 +432,387 @@ fn handle_request(
         return respond_error(stream, 403, request, opts, keep_alive);
     }
 
+    if let Some(route) = classify_script(base_dir, &resolved, opts) {
+        return dispatch_script(
+            stream, base_dir, &resolved, &route, request, opts, body, client, head_only, keep_alive,
+        );
+    }
+
+    if request.method != "GET" && request.method != "HEAD" {
+        return respond_error(stream, 405, request, opts, keep_alive);
+    }
     serve_file(stream, &resolved, request, opts, head_only, keep_alive)
+}
+
+/// Which of the two CGI 1.1 execution paths (IDEA.md "Multi-language script
+/// execution") a resolved, existing file should be routed through — `None`
+/// means "serve as static content".
+enum ScriptRoute {
+    /// `cgi-bin/` location-based, or a `script_handlers` extension mapped to
+    /// the reserved `exec` value: the file itself is exec'd directly and
+    /// must be independently executable with its own shebang/native binary.
+    ExecDirect,
+    /// `script_handlers` extension-based dispatch: the file is passed as an
+    /// argument to the given interpreter command.
+    Interpreter(String),
+}
+
+/// Classifies `resolved` per IDEA.md "Multi-language script execution":
+/// path 1 (`cgi-bin/`, location wins unconditionally, extension ignored),
+/// then path 2 (`script_handlers` extension table, built-in-table base
+/// merged under global/per-project config — see
+/// `config::builtin_script_handlers`). Returns `None` for plain static
+/// content (no extension match, or the extension is explicitly disabled via
+/// a `null`/empty `script_handlers` entry).
+fn classify_script(base_dir: &Path, resolved: &Path, opts: &ServeOptions) -> Option<ScriptRoute> {
+    if let Ok(rel) = resolved.strip_prefix(base_dir) {
+        if rel
+            .components()
+            .next()
+            .map(|c| c.as_os_str() == "cgi-bin")
+            .unwrap_or(false)
+        {
+            return Some(ScriptRoute::ExecDirect);
+        }
+    }
+    let ext = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext.is_empty() {
+        return None;
+    }
+    match opts.script_handlers.get(&ext) {
+        Some(Some(cmd)) if cmd == "exec" => Some(ScriptRoute::ExecDirect),
+        Some(Some(cmd)) => Some(ScriptRoute::Interpreter(cmd.clone())),
+        Some(None) | None => None,
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Resolves an interpreter binary for `script_handlers` per-request (IDEA.md
+/// "Interpreter discovery" — never cached, so installing/removing an
+/// interpreter while the server runs takes effect on the very next request).
+/// Absolute paths are checked directly; bare names are searched on `$PATH`.
+fn find_interpreter(bin: &str) -> Option<PathBuf> {
+    let path = Path::new(bin);
+    if path.is_absolute() {
+        return if is_executable_file(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(bin);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Splits a script's raw stdout into its CGI header block and body (IDEA.md
+/// "CGI 1.1 protocol semantics" — headers first, blank-line-terminated,
+/// then body). Falls back to "no headers, whole output is body" when the
+/// output doesn't contain a header/body separator or doesn't parse as
+/// `Key: value` lines, matching the documented `Content-Type: text/html` /
+/// `200 OK` fallback.
+fn parse_cgi_output(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
+    let split_at = find_subslice(raw, b"\r\n\r\n")
+        .map(|i| (i, i + 4))
+        .or_else(|| find_subslice(raw, b"\n\n").map(|i| (i, i + 2)));
+    let Some((head_end, body_start)) = split_at else {
+        return (Vec::new(), raw);
+    };
+    let head_str = String::from_utf8_lossy(&raw[..head_end]);
+    let mut headers = Vec::new();
+    for line in head_str.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once(':') {
+            Some((k, v)) => headers.push((k.trim().to_string(), v.trim().to_string())),
+            None => return (Vec::new(), raw),
+        }
+    }
+    if headers.is_empty() {
+        return (Vec::new(), raw);
+    }
+    (headers, &raw[body_start..])
+}
+
+/// Renders a 500 with the script/CGI execution's own server-side failure
+/// detail folded in under `--debug` (IDEA.md "Debug/error forwarding" —
+/// only used when the script produced no usable output at all).
+fn respond_script_failure(
+    stream: &mut TcpStream,
+    request: &Request,
+    opts: &ServeOptions,
+    keep_alive: bool,
+    detail: &str,
+) -> std::io::Result<(u16, u64)> {
+    let body = error_page_with_trace(500, request, opts.debug, Some(detail));
+    let head_only = request.method == "HEAD";
+    write_response(
+        stream,
+        500,
+        reason_phrase(500),
+        body.as_bytes(),
+        head_only,
+        keep_alive,
+        &[(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )],
+    )
+}
+
+/// Executes a CGI/script request end-to-end (IDEA.md "Multi-language script
+/// execution" → "CGI 1.1 protocol semantics"): resolves the program to run
+/// (per `route`), builds the full CGI 1.1 environment, streams the request
+/// body to the child's stdin, captures stdout/stderr, and translates the
+/// script's CGI-style output into an HTTP response. No execution timeout —
+/// "No artificial resource limits" (IDEA.md "Security").
+#[allow(clippy::too_many_arguments)]
+fn dispatch_script(
+    stream: &mut TcpStream,
+    base_dir: &Path,
+    script_path: &Path,
+    route: &ScriptRoute,
+    request: &Request,
+    opts: &ServeOptions,
+    body: &[u8],
+    client: &str,
+    head_only: bool,
+    keep_alive: bool,
+) -> std::io::Result<(u16, u64)> {
+    use std::process::{Command, Stdio};
+
+    let (program, fixed_args) = match route {
+        ScriptRoute::ExecDirect => {
+            if !is_executable_file(script_path) {
+                return respond_script_failure(
+                    stream,
+                    request,
+                    opts,
+                    keep_alive,
+                    &format!(
+                        "{} is not marked executable (cgi-bin/exec-directly scripts require \
+                         their own executable bit and shebang/native binary)",
+                        script_path.display()
+                    ),
+                );
+            }
+            (script_path.to_path_buf(), Vec::new())
+        }
+        ScriptRoute::Interpreter(cmd) => {
+            let mut parts = cmd.split_whitespace();
+            let bin = match parts.next() {
+                Some(b) => b,
+                None => {
+                    return respond_script_failure(
+                        stream,
+                        request,
+                        opts,
+                        keep_alive,
+                        "script_handlers entry resolved to an empty command",
+                    );
+                }
+            };
+            let fixed_args: Vec<String> = parts.map(str::to_string).collect();
+            match find_interpreter(bin) {
+                Some(p) => (p, fixed_args),
+                None => {
+                    let msg = format!("{bin} is not installed");
+                    return write_response(
+                        stream,
+                        503,
+                        "Service Unavailable",
+                        msg.as_bytes(),
+                        head_only,
+                        keep_alive,
+                        &[(
+                            "Content-Type".to_string(),
+                            "text/plain; charset=utf-8".to_string(),
+                        )],
+                    );
+                }
+            }
+        }
+    };
+
+    let query = request.path.split_once('?').map(|x| x.1).unwrap_or("");
+    let script_name = format!(
+        "/{}",
+        script_path
+            .strip_prefix(base_dir)
+            .unwrap_or(script_path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let (remote_addr, remote_port) = client.rsplit_once(':').unwrap_or((client, ""));
+
+    let mut cmd = Command::new(&program);
+    if matches!(route, ScriptRoute::Interpreter(_)) {
+        for a in &fixed_args {
+            cmd.arg(a);
+        }
+        cmd.arg(script_path);
+    }
+
+    let work_dir = script_path.parent().unwrap_or(base_dir);
+    cmd.current_dir(work_dir);
+    cmd.env("REQUEST_METHOD", &request.method);
+    cmd.env("QUERY_STRING", query);
+    cmd.env(
+        "CONTENT_TYPE",
+        request
+            .headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    cmd.env("CONTENT_LENGTH", body.len().to_string());
+    cmd.env("SCRIPT_NAME", &script_name);
+    cmd.env("SCRIPT_FILENAME", script_path.to_string_lossy().to_string());
+    cmd.env("PATH_INFO", "");
+    cmd.env("PATH_TRANSLATED", "");
+    cmd.env(
+        "SERVER_NAME",
+        opts.fqdn.clone().unwrap_or_else(|| "localhost".to_string()),
+    );
+    cmd.env("SERVER_PORT", opts.port.to_string());
+    cmd.env("SERVER_PROTOCOL", &request.version);
+    cmd.env(
+        "SERVER_SOFTWARE",
+        format!("cashttpd/{}", crate::support::version::VERSION),
+    );
+    cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
+    cmd.env("REMOTE_ADDR", remote_addr);
+    cmd.env("REMOTE_PORT", remote_port);
+    cmd.env("DOCUMENT_ROOT", base_dir.to_string_lossy().to_string());
+    if opts.tls_enabled {
+        cmd.env("HTTPS", "on");
+    }
+    for (k, v) in &request.headers {
+        if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let var = format!("HTTP_{}", k.to_ascii_uppercase().replace('-', "_"));
+        cmd.env(var, v);
+    }
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            return respond_script_failure(
+                stream,
+                request,
+                opts,
+                keep_alive,
+                &format!("failed to start {}: {err}", program.display()),
+            );
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if !body.is_empty() {
+            let _ = stdin.write_all(body);
+        }
+        drop(stdin);
+    }
+
+    let mut stdout_buf = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout_buf);
+    }
+    let mut stderr_buf = Vec::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr_buf);
+    }
+    let wait_result = child.wait();
+
+    if stdout_buf.is_empty() {
+        let detail = match wait_result {
+            Ok(status) if !status.success() => format!(
+                "{} exited with {status}\n{}",
+                program.display(),
+                String::from_utf8_lossy(&stderr_buf)
+            ),
+            Err(err) => format!("failed to wait on {}: {err}", program.display()),
+            Ok(_) => String::from_utf8_lossy(&stderr_buf).to_string(),
+        };
+        return respond_script_failure(stream, request, opts, keep_alive, &detail);
+    }
+
+    let (headers, cgi_body) = parse_cgi_output(&stdout_buf);
+    let mut resp_status = 200u16;
+    let mut resp_reason = "OK".to_string();
+    let mut extra: Vec<(String, String)> = Vec::new();
+    let mut has_content_type = false;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("status") {
+            let mut parts = v.splitn(2, ' ');
+            if let Some(code) = parts.next().and_then(|c| c.trim().parse::<u16>().ok()) {
+                resp_status = code;
+                resp_reason = parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| reason_phrase(code))
+                    .to_string();
+            }
+            continue;
+        }
+        if k.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        extra.push((k, v));
+    }
+    if !has_content_type {
+        extra.push((
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        ));
+    }
+
+    write_response(
+        stream,
+        resp_status,
+        &resp_reason,
+        cgi_body,
+        head_only,
+        keep_alive,
+        &extra,
+    )
 }
 
 fn percent_decode(s: &str) -> String {
@@ -709,11 +1137,30 @@ fn reason_phrase(status: u16) -> &'static str {
 /// Embedded mobile-first error page (IDEA.md "Error pages and debug mode")
 /// — no dependency on any file existing in `base_dir`.
 fn error_page(status: u16, request: &Request, debug: bool) -> String {
+    error_page_with_trace(status, request, debug, None)
+}
+
+/// Same as `error_page`, additionally folding in the server's own view of a
+/// script/CGI execution failure under `--debug` (IDEA.md "Debug/error
+/// forwarding" — only surfaced when the script produced no usable output at
+/// all; a script's own error output/page is always relayed as-is, never
+/// routed through this path).
+fn error_page_with_trace(
+    status: u16,
+    request: &Request,
+    debug: bool,
+    trace: Option<&str>,
+) -> String {
     let reason = reason_phrase(status);
     let detail = if debug {
-        "<p class=\"detail\">Debug mode is on: no script/CGI execution has run yet for this \
-         request, so there is no interpreter trace to show for this error.</p>"
-            .to_string()
+        match trace {
+            Some(t) => format!(
+                "<p class=\"detail\">Debug mode is on — server-side failure detail:</p>\
+                 <pre class=\"detail\">{}</pre>",
+                html_escape(t)
+            ),
+            None => "<p class=\"detail\">Debug mode is on.</p>".to_string(),
+        }
     } else {
         String::new()
     };
@@ -727,7 +1174,8 @@ fn error_page(status: u16, request: &Request, debug: bool) -> String {
          padding:1.5rem}}h1{{font-size:2.5rem;margin:0 0 .25rem}}\
          .reason{{font-size:1.1rem;color:#94a3b8;margin:0 0 1rem}}\
          code{{background:#334155;padding:.15rem .4rem;border-radius:.25rem}}\
-         .detail{{color:#fbbf24}}</style></head><body><div class=\"card\">\
+         .detail{{color:#fbbf24}}pre.detail{{white-space:pre-wrap;word-break:break-word;\
+         overflow-x:auto}}</style></head><body><div class=\"card\">\
          <h1>{status}</h1><p class=\"reason\">{reason}</p>\
          <p><code>{method} {path}</code></p>{detail}</div></body></html>",
         method = html_escape(&request.method),
@@ -1298,5 +1746,212 @@ mod tests {
     #[test]
     fn html_escape_escapes_special_characters() {
         assert_eq!(html_escape("<a>&\"b\""), "&lt;a&gt;&amp;&quot;b&quot;");
+    }
+
+    #[test]
+    fn parse_cgi_output_splits_headers_and_body() {
+        let raw = b"Content-Type: text/plain\r\nX-Foo: bar\r\n\r\nhello world";
+        let (headers, body) = parse_cgi_output(raw);
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("X-Foo".to_string(), "bar".to_string()),
+            ]
+        );
+        assert_eq!(body, b"hello world");
+    }
+
+    #[test]
+    fn parse_cgi_output_falls_back_to_whole_body_without_header_block() {
+        let raw = b"just a plain body, no headers here";
+        let (headers, body) = parse_cgi_output(raw);
+        assert!(headers.is_empty());
+        assert_eq!(body, raw);
+    }
+
+    #[test]
+    fn classify_script_routes_cgi_bin_regardless_of_extension() {
+        let dir = unique_dir("classify-cgi-bin");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let opts = test_opts(base_dir.clone());
+        let script = base_dir.join("cgi-bin").join("thing.php");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert!(matches!(
+            classify_script(&base_dir, &script, &opts),
+            Some(ScriptRoute::ExecDirect)
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classify_script_routes_extension_to_interpreter() {
+        let dir = unique_dir("classify-ext");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let mut opts = test_opts(base_dir.clone());
+        opts.script_handlers
+            .insert("py".to_string(), Some("python3".to_string()));
+        let script = base_dir.join("app.py");
+        fs::write(&script, "print('hi')\n").unwrap();
+        match classify_script(&base_dir, &script, &opts) {
+            Some(ScriptRoute::Interpreter(cmd)) => assert_eq!(cmd, "python3"),
+            other => panic!("expected Interpreter route, got {other:?}"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    impl std::fmt::Debug for ScriptRoute {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ScriptRoute::ExecDirect => write!(f, "ExecDirect"),
+                ScriptRoute::Interpreter(c) => write!(f, "Interpreter({c})"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_script_disabled_entry_serves_as_static() {
+        let dir = unique_dir("classify-disabled");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let mut opts = test_opts(base_dir.clone());
+        opts.script_handlers.insert("pl".to_string(), None);
+        let script = base_dir.join("legacy.pl");
+        fs::write(&script, "print \"hi\";\n").unwrap();
+        assert!(classify_script(&base_dir, &script, &opts).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classify_script_unrecognized_extension_serves_as_static() {
+        let dir = unique_dir("classify-static");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let opts = test_opts(base_dir.clone());
+        let file = base_dir.join("plain.txt");
+        fs::write(&file, "hi").unwrap();
+        assert!(classify_script(&base_dir, &file, &opts).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_interpreter_resolves_a_known_path_binary() {
+        assert!(find_interpreter("sh").is_some());
+    }
+
+    #[test]
+    fn find_interpreter_returns_none_for_unknown_binary() {
+        assert!(find_interpreter("cashttpd-definitely-not-a-real-binary").is_none());
+    }
+
+    #[test]
+    fn cgi_bin_script_executes_and_returns_its_output() {
+        let dir = unique_dir("cgi-bin-exec");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("cgi-bin").join("hello.cgi");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nhello from cgi-bin, method=%s\\n' \"$REQUEST_METHOD\"\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&script, perms).unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /cgi-bin/hello.cgi HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain"));
+        assert!(response.ends_with("hello from cgi-bin, method=GET\n"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cgi_bin_non_executable_file_returns_500() {
+        let dir = unique_dir("cgi-bin-noexec");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("cgi-bin").join("hello.cgi");
+        fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /cgi-bin/hello.cgi HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interpreter_dispatch_runs_script_and_streams_post_body() {
+        let dir = unique_dir("interp-python");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("echo.py");
+        fs::write(
+            &script,
+            "import sys\n\
+             body = sys.stdin.read()\n\
+             sys.stdout.write('Content-Type: text/plain\\r\\n\\r\\n')\n\
+             sys.stdout.write('got:' + body)\n",
+        )
+        .unwrap();
+
+        let opts = {
+            let mut o = test_opts(base_dir.clone());
+            o.script_handlers
+                .insert("py".to_string(), Some("python3".to_string()));
+            o
+        };
+
+        let payload = b"ping";
+        let request_line = format!(
+            "POST /echo.py HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
+        let count = Arc::new(AtomicU64::new(0));
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, &base_dir, &opts, &logger, "127.0.0.1:1", &count).unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request_line.as_bytes()).unwrap();
+        client.write_all(payload).unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        handle.join().unwrap();
+        let response = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("got:ping"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_interpreter_returns_503() {
+        let dir = unique_dir("interp-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("thing.zz");
+        fs::write(&script, "irrelevant").unwrap();
+        let mut opts = test_opts(base_dir.clone());
+        opts.script_handlers.insert(
+            "zz".to_string(),
+            Some("cashttpd-definitely-not-a-real-binary".to_string()),
+        );
+
+        let response = request_over_loopback_opts(opts, "GET /thing.zz HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response.contains("cashttpd-definitely-not-a-real-binary is not installed"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

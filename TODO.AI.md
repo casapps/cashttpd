@@ -9,13 +9,30 @@ opt-in directory listing (with human-readable file sizes), embedded
 mobile-first dark-themed error pages (debug-gated detail), `.ht*` trust-
 boundary denial (never served as static content), and unconditional
 Apache-combined-format access logging plus Apache-style error logging to
-`{log_dir}/{derived_name}_{access,error}.log`. Still open (none of this is
-implemented yet):
-- Chunked *request* body decoding (only response framing is `Content-Length`
-  today; no request body is read/forwarded anywhere yet since there is no
-  CGI/proxy consumer for one).
-- CGI/multi-language script execution (`script_handlers`, CGI 1.1 protocol,
-  503-for-missing-interpreter) — IDEA.md "Multi-language script execution".
+`{log_dir}/{derived_name}_{access,error}.log`.
+
+CGI/multi-language script execution is now implemented (IDEA.md
+"Multi-language script execution"): `classify_script` routes a resolved
+file to `cgi-bin/` exec-by-shebang (location-based, any extension, always
+wins over `script_handlers` inside `cgi-bin/`) or to extension-based
+`script_handlers` interpreter dispatch (built-in table —
+`config::builtin_script_handlers` — merged under global/per-project
+config, including the reserved `exec` value and per-request interpreter
+discovery via `$PATH`/absolute path); `dispatch_script` builds the full
+CGI 1.1 environment (`REQUEST_METHOD`…`HTTP_*`), streams the request body
+(now read per `Content-Length` in `serve_connection` for any method) to
+the child's stdin, and `parse_cgi_output` splits stdout into the CGI
+header block (including a `Status:` override) and body, falling back to
+`text/html`/`200 OK` when the script emits no header block. A missing
+interpreter binary is `503`/`"{lang} is not installed"`; a script that
+produces no output at all surfaces the server's own stderr/exit-status
+view under `--debug` (`error_page_with_trace`) — a script's own output is
+otherwise always relayed as-is, never intercepted. Still open:
+- Chunked *request* body decoding (`Content-Length` only; no
+  `Transfer-Encoding: chunked` request-body support yet).
+- PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
+  full script path to exist as a literal file/dir and does not yet split a
+  trailing extra path segment off after the script name.
 - `.htaccess`/`.htpasswd` compatibility (recursive discovery, cascade merge,
   AuthType/Require/Order-Allow-Deny, RewriteEngine/RewriteRule, ErrorDocument,
   DirectoryIndex, Options) — IDEA.md "`.htaccess`/`.htpasswd` compatibility".

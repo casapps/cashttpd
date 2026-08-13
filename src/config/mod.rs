@@ -91,6 +91,22 @@ fn opt_str_map(v: &Value, key: &str) -> BTreeMap<String, Option<String>> {
         .unwrap_or_default()
 }
 
+/// Built-in extension → interpreter command table (IDEA.md "Multi-language
+/// script execution" → "Built-in table"). `script_handlers` config
+/// (global then per-project) merges on top of this key-by-key — it never
+/// wholesale-replaces it. The reserved value `exec` (used here for `.cgi`)
+/// opts an extension into exec-directly mode, matching a `cgi-bin/` file.
+pub fn builtin_script_handlers() -> BTreeMap<String, Option<String>> {
+    let mut m = BTreeMap::new();
+    m.insert("php".to_string(), Some("php-cgi".to_string()));
+    m.insert("py".to_string(), Some("python3".to_string()));
+    m.insert("pl".to_string(), Some("perl".to_string()));
+    m.insert("lua".to_string(), Some("lua".to_string()));
+    m.insert("rb".to_string(), Some("ruby".to_string()));
+    m.insert("cgi".to_string(), Some("exec".to_string()));
+    m
+}
+
 fn parse_layer(value: &Value) -> Layer {
     let tls_enabled = value.get("tls").and_then(|t| b(t, "enabled"));
     let proxy_raw = value.get("proxy");
@@ -152,7 +168,6 @@ pub struct Resolved {
     pub tls_enabled: bool,
     pub directory_listing: bool,
     pub mime_types: BTreeMap<String, String>,
-    #[allow(dead_code)]
     pub script_handlers: BTreeMap<String, Option<String>>,
     #[allow(dead_code)]
     pub proxy: ProxyLayer,
@@ -377,7 +392,8 @@ pub fn load(cli: &CliOverrides, autogenerate: bool) -> io::Result<Resolved> {
     let mut mime_types = global.mime_types.clone();
     mime_types.extend(project.mime_types.clone());
 
-    let mut script_handlers = global.script_handlers.clone();
+    let mut script_handlers = builtin_script_handlers();
+    script_handlers.extend(global.script_handlers.clone());
     script_handlers.extend(project.script_handlers.clone());
 
     let proxy = ProxyLayer {
