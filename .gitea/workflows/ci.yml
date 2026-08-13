@@ -105,7 +105,13 @@ jobs:
             -v "$PWD":/work -w /work cashttpd-toolchain:ci \
             -c 'cargo about generate about.hbs' > LICENSE.generated.md
           sed -n '/<!-- GENERATED:/,$p' LICENSE.md > LICENSE.committed-generated.md
-          diff LICENSE.committed-generated.md LICENSE.generated.md
+          # Some upstream crates (e.g. mime_guess) ship an embedded LICENSE
+          # file with CRLF line endings, which cargo-about copies verbatim;
+          # `.gitattributes`' `* text=auto` normalizes CRLF to LF on commit,
+          # so the checked-out committed file never has them. Strip \r from
+          # both sides before diffing so that normalization isn't reported
+          # as drift.
+          diff <(tr -d '\r' < LICENSE.committed-generated.md) <(tr -d '\r' < LICENSE.generated.md)
 
   build:
     needs: test
