@@ -33,3 +33,24 @@ pub fn detect_ui_mode(args: &[String]) -> UiMode {
         UiMode::Cli
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_flag_forces_cli_mode_regardless_of_terminal_state() {
+        let args = vec!["cashttpd".to_string(), "--daemon".to_string()];
+        assert_eq!(detect_ui_mode(&args), UiMode::Cli);
+    }
+
+    #[test]
+    fn no_daemon_flag_falls_back_to_cli_in_non_terminal_test_harness() {
+        // The test harness's stdin/stdout are never a real TTY, so this
+        // always takes the non-interactive fallback branch — it still
+        // exercises the full decision chain (TERM/CI env reads) without
+        // depending on real terminal state.
+        let args: Vec<String> = vec![];
+        assert_eq!(detect_ui_mode(&args), UiMode::Cli);
+    }
+}

@@ -6,3 +6,11 @@
 pub fn run() {
     println!("cashttpd {} (tui mode)", crate::support::version::VERSION);
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn run_prints_the_banner_without_panicking() {
+        super::run();
+    }
+}

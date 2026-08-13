@@ -233,3 +233,204 @@ fn write_response(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "cashttpd-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        dir
+    }
+
+    #[test]
+    fn parse_serve_options_defaults_when_no_flags() {
+        let opts = parse_serve_options(&[]);
+        let default = ServeOptions::default();
+        assert_eq!(opts.listen, default.listen);
+        assert_eq!(opts.port, default.port);
+        assert_eq!(opts.base_dir, default.base_dir);
+    }
+
+    #[test]
+    fn parse_serve_options_reads_all_flags() {
+        let args = vec![
+            "--listen".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "9090".to_string(),
+            "--dir".to_string(),
+            "/tmp/somewhere".to_string(),
+        ];
+        let opts = parse_serve_options(&args);
+        assert_eq!(opts.listen, "127.0.0.1");
+        assert_eq!(opts.port, 9090);
+        assert_eq!(opts.base_dir, PathBuf::from("/tmp/somewhere"));
+    }
+
+    #[test]
+    fn parse_serve_options_ignores_unparseable_port() {
+        let args = vec!["--port".to_string(), "not-a-number".to_string()];
+        let opts = parse_serve_options(&args);
+        assert_eq!(opts.port, ServeOptions::default().port);
+    }
+
+    #[test]
+    fn parse_serve_options_ignores_trailing_flag_without_value() {
+        let args = vec!["--listen".to_string()];
+        let opts = parse_serve_options(&args);
+        assert_eq!(opts.listen, ServeOptions::default().listen);
+    }
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    #[test]
+    fn write_response_full_body_includes_headers_and_content() {
+        let (mut server, mut client) = loopback_pair();
+        write_response(&mut server, 200, "OK", b"hello", false).unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(text.ends_with("hello"));
+    }
+
+    #[test]
+    fn write_response_head_only_omits_body() {
+        let (mut server, mut client) = loopback_pair();
+        write_response(&mut server, 404, "Not Found", b"Not Found", true).unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    fn request_over_loopback(base_dir: &Path, request_line: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_dir = base_dir.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, &base_dir).unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request_line.as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        handle.join().unwrap();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[test]
+    fn handle_connection_serves_existing_file() {
+        let dir = unique_dir("serve");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hello.txt"), b"hi there").unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /hello.txt HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("hi there"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_connection_defaults_root_to_index_html() {
+        let dir = unique_dir("index");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), b"<html></html>").unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET / HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("<html></html>"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_connection_returns_404_for_missing_file() {
+        let dir = unique_dir("missing");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /nope.txt HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_connection_blocks_path_traversal_outside_base_dir() {
+        let dir = unique_dir("traversal");
+        fs::create_dir_all(&dir).unwrap();
+        // A file that genuinely exists on disk just outside base_dir — the
+        // canonicalize()+starts_with() check must still reject it, proving
+        // the traversal guard runs (not just a missing-file 404).
+        let secret_parent = std::env::temp_dir();
+        let secret_name = format!(
+            "cashttpd-test-secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(secret_parent.join(&secret_name), b"top secret").unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let request_line = format!("GET /../{secret_name} HTTP/1.1\r\n\r\n");
+        let response = request_over_loopback(&base_dir, &request_line);
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_file(secret_parent.join(&secret_name)).ok();
+    }
+
+    #[test]
+    fn handle_connection_rejects_unsupported_method() {
+        let dir = unique_dir("method");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "POST / HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handle_connection_head_request_omits_body() {
+        let dir = unique_dir("head");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), b"<html></html>").unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "HEAD / HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}

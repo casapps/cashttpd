@@ -74,3 +74,15 @@ fn ensure_service_account() -> std::io::Result<(nix::unistd::Uid, nix::unistd::G
 
     Ok((Uid::from_raw(SERVICE_UID), Gid::from_raw(SERVICE_GID)))
 }
+
+// No unit tests for `drop_privileges_if_root()` / `ensure_service_account()`:
+// the project's toolchain container (`casjaysdev/rust:latest`) runs as real
+// root, so calling `drop_privileges_if_root()` in-process would take the
+// genuine root path — writing to `/etc/passwd`/`/etc/group` and calling
+// `setuid`/`setgid`, which is process-wide and would permanently drop
+// privileges for every other test sharing this test binary's process
+// (Rust's test harness runs tests as threads within one process). There is
+// no safe non-root branch to exercise here without either running the
+// entire test binary as a non-root user (not how CI invokes `cargo test`)
+// or refactoring privilege-drop out of a directly-callable function, which
+// is a larger design change than this coverage pass is scoped to make.

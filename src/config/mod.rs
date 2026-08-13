@@ -10,3 +10,13 @@
 pub fn validate() -> Result<(), String> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_reports_success_for_current_no_op_implementation() {
+        assert_eq!(validate(), Ok(()));
+    }
+}
