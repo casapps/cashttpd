@@ -1,4 +1,4 @@
-## [ ] HTTP/1.1 core conformance is done; script/proxy/TLS/htaccess layers remain
+## [x] HTTP/1.1 core conformance, script/proxy/TLS/htaccess layers — closed
 Read: AI.md PART 7, PART 14; IDEA.md "Business logic"
 `src/server/mod.rs` now implements: full request-header parsing,
 persistent (keep-alive) connections, conditional requests
@@ -20,19 +20,29 @@ wins over `script_handlers` inside `cgi-bin/`) or to extension-based
 config, including the reserved `exec` value and per-request interpreter
 discovery via `$PATH`/absolute path); `dispatch_script` builds the full
 CGI 1.1 environment (`REQUEST_METHOD`…`HTTP_*`), streams the request body
-(now read per `Content-Length` in `serve_connection` for any method) to
-the child's stdin, and `parse_cgi_output` splits stdout into the CGI
-header block (including a `Status:` override) and body, falling back to
-`text/html`/`200 OK` when the script emits no header block. A missing
-interpreter binary is `503`/`"{lang} is not installed"`; a script that
-produces no output at all surfaces the server's own stderr/exit-status
-view under `--debug` (`error_page_with_trace`) — a script's own output is
-otherwise always relayed as-is, never intercepted. Still open:
-- Chunked *request* body decoding (`Content-Length` only; no
-  `Transfer-Encoding: chunked` request-body support yet).
-- PATH_INFO/PATH_TRANSLATED are always empty — the resolver requires the
-  full script path to exist as a literal file/dir and does not yet split a
-  trailing extra path segment off after the script name.
+(read per `Content-Length` or `Transfer-Encoding: chunked` in
+`serve_connection` for any method — see below) to the child's stdin, and
+`parse_cgi_output` splits stdout into the CGI header block (including a
+`Status:` override) and body, falling back to `text/html`/`200 OK` when
+the script emits no header block. A missing interpreter binary is
+`503`/`"{lang} is not installed"`; a script that produces no output at
+all surfaces the server's own stderr/exit-status view under `--debug`
+(`error_page_with_trace`) — a script's own output is otherwise always
+relayed as-is, never intercepted.
+
+`serve_connection` now also decodes `Transfer-Encoding: chunked` request
+bodies (RFC 7230 §4.1) via `read_chunked_body`, taking precedence over
+any `Content-Length` present on the same message per RFC 7230 §3.3.3;
+malformed chunk framing closes the connection the same way a failed
+`Content-Length` read does. `PATH_INFO`/`PATH_TRANSLATED` are now
+resolved per CGI 1.1 §4.1.5/§4.1.6 (Apache-compatible "longest
+existing-file prefix" rule): when the full literal request path doesn't
+exist on disk, `resolve_script_path_info` walks the path's ancestor
+`/`-segment prefixes (never escaping `base_dir`) for the first one that
+is a file `classify_script` recognizes as a script, and threads the
+unconsumed trailing segments through `dispatch_script` into the CGI
+environment; plain static-file resolution and the directory/default-index
+branch are unaffected. This closes out item 1's "Still open" list.
 
 `.htaccess`/`.htpasswd` Apache-compatible per-directory configuration is now
 implemented in `src/server/htaccess.rs` (IDEA.md "`.htaccess`/`.htpasswd`
@@ -214,10 +224,9 @@ value before the rest of the reload proceeds; a listener-rebind attempt
 that fails (e.g. targeting a privileged port after `drop_privileges_if_root`
 already ran, or a port already in use) is likewise warned/recorded and
 its `listen`/`port`/`tls_enabled`/`fqdn` are reverted to the still-bound
-values, rather than crashing or misreporting the running state. This
-closes out item 1's "Still open" list except for chunked request-body
-decoding and the PATH_INFO/PATH_TRANSLATED gap above. Documented gap: a
-true end-to-end test that calls `server::run` directly was judged unsafe
+values, rather than crashing or misreporting the running state.
+Documented gap: a true end-to-end test that calls `server::run` directly
+was judged unsafe
 to add — `run()` calls `platform::drop_privileges_if_root`, which performs
 an irreversible `setuid`/`setgid` on the *entire test process* when run as
 root (the default inside the `casjaysdev/rust:latest` verification

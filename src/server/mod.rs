@@ -47,8 +47,22 @@
 //! dropped) is logged as a warning and recorded on the `/server-info`
 //! dashboard, never silently ignored or a crash.
 //!
-//! Still open (tracked in TODO.AI.md): chunked *request* body decoding
-//! (`Content-Length` only).
+//! Request bodies also support `Transfer-Encoding: chunked` (RFC 7230
+//! §4.1) in addition to `Content-Length`: `read_chunked_body` decodes the
+//! classic chunk-size/chunk-data/CRLF framing (chunk-extensions and
+//! trailer headers are read and discarded, never merged into the parsed
+//! request's headers), taking precedence over any `Content-Length` present
+//! on the same message per RFC 7230 §3.3.3; malformed framing closes the
+//! connection the same way a failed `Content-Length` read does.
+//!
+//! Script/CGI dispatch also resolves `PATH_INFO`/`PATH_TRANSLATED` per CGI
+//! 1.1 semantics: when the full literal request path does not exist,
+//! `handle_request` walks the path's ancestor components looking for the
+//! longest existing-file prefix that `classify_script` still recognizes as
+//! a script; the remaining trailing segments become `PATH_INFO` (and
+//! `PATH_TRANSLATED` is derived from it under `base_dir`), threaded through
+//! `dispatch_script` into the CGI environment. Plain static-file resolution
+//! is unaffected — PATH_INFO splitting only ever applies to script routes.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -745,6 +759,58 @@ fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Option<Request>> 
     }))
 }
 
+/// Decodes a `Transfer-Encoding: chunked` request body (RFC 7230 §4.1) from
+/// `reader`: repeatedly reads a `CRLF`-terminated chunk-size line (hex,
+/// optional `;` chunk-extensions, discarded), then that many bytes of chunk
+/// data plus its trailing `CRLF`, until a `0`-size chunk is seen, after which
+/// any trailer header lines are read and discarded (no trailer-header
+/// support — never merged into `request.headers`) up to the terminating
+/// blank line. No artificial size cap (IDEA.md "Security"), matching the
+/// `Content-Length` path. Returns `Ok(None)` on any malformed chunk framing
+/// (bad hex size, missing CRLF, EOF mid-chunk) — the caller treats that the
+/// same as a `Content-Length` `read_exact` failure and closes the
+/// connection.
+fn read_chunked_body(reader: &mut BufReader<Conn>) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        if reader.read_line(&mut size_line)? == 0 {
+            return Ok(None);
+        }
+        let size_line = size_line.trim_end_matches(['\r', '\n']);
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(size_str, 16) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        if size == 0 {
+            loop {
+                let mut trailer_line = String::new();
+                if reader.read_line(&mut trailer_line)? == 0 {
+                    return Ok(None);
+                }
+                let trailer_line = trailer_line.trim_end_matches(['\r', '\n']);
+                if trailer_line.is_empty() {
+                    break;
+                }
+            }
+            return Ok(Some(body));
+        }
+
+        let mut chunk = vec![0u8; size];
+        if reader.read_exact(&mut chunk).is_err() {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+
+        let mut crlf = [0u8; 2];
+        if reader.read_exact(&mut crlf).is_err() || &crlf != b"\r\n" {
+            return Ok(None);
+        }
+    }
+}
+
 /// Serves every keep-alive request on one connection (RFC 9112 §9.3 —
 /// HTTP/1.1 connections are persistent unless `Connection: close` is sent).
 #[allow(clippy::too_many_arguments)]
@@ -774,17 +840,33 @@ fn serve_connection(
             .unwrap_or_else(|| request.version == "HTTP/1.1");
 
         // No artificial resource limits (IDEA.md "Security" — a script/CGI
-        // request body is read in full per its own `Content-Length`, never
-        // capped or streamed with a server-imposed ceiling).
-        let content_length: usize = request
+        // request body is read in full per its own `Content-Length` or
+        // `Transfer-Encoding: chunked` framing, never capped or streamed
+        // with a server-imposed ceiling).
+        let chunked = request
             .headers
-            .get("content-length")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 && reader.read_exact(&mut body).is_err() {
-            return Ok(());
-        }
+            .get("transfer-encoding")
+            .map(|v| v.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false);
+        let body = if chunked {
+            // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over any
+            // Content-Length present on the same message.
+            match read_chunked_body(&mut reader)? {
+                Some(b) => b,
+                None => return Ok(()),
+            }
+        } else {
+            let content_length: usize = request
+                .headers
+                .get("content-length")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                return Ok(());
+            }
+            body
+        };
 
         let outcome = handle_request(
             reader.get_mut(),
@@ -940,6 +1022,61 @@ fn respond_with_error_document(
         }
     }
     respond_error(stream, status, request, opts, keep_alive)
+}
+
+/// Best-effort CGI 1.1 PATH_INFO/PATH_TRANSLATED resolution (CGI 1.1
+/// §4.1.5/§4.1.6; Apache-compatible "longest existing-file prefix" rule):
+/// only reached when the full literal `decoded` path does not exist on
+/// disk at all. Walks the path's ancestor `/`-separated segment prefixes —
+/// from the immediate parent up to `base_dir` itself, each still required
+/// to stay within `base_dir` (never escaping it) — looking for the first
+/// prefix that exists, is a file, and `classify_script` still recognizes
+/// as a script; the unconsumed trailing segments become `PATH_INFO`
+/// (leading-`/`-prefixed), and `PATH_TRANSLATED` is `PATH_INFO` resolved
+/// under `base_dir` (which need not itself exist — matching real CGI/
+/// Apache behavior for a nonexistent trailing segment). Returns `None` if
+/// no ancestor qualifies, in which case the caller falls through to its
+/// normal 404 — this never applies to plain static-file resolution or to
+/// the directory/default-index branch, only to a fully-nonexistent literal
+/// path.
+fn resolve_script_path_info(
+    base_dir: &Path,
+    decoded: &str,
+    opts: &ServeOptions,
+) -> Option<(PathBuf, ScriptRoute, String, String)> {
+    let segs: Vec<&str> = decoded
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for popped in 1..=segs.len() {
+        let prefix = &segs[..segs.len() - popped];
+        let candidate = if prefix.is_empty() {
+            base_dir.to_path_buf()
+        } else {
+            base_dir.join(prefix.join("/"))
+        };
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        if resolved != base_dir && !resolved.starts_with(base_dir) {
+            continue;
+        }
+        if !resolved.is_file() {
+            continue;
+        }
+        let Some(route) = classify_script(base_dir, &resolved, opts) else {
+            continue;
+        };
+        let remaining = &segs[segs.len() - popped..];
+        let path_info = format!("/{}", remaining.join("/"));
+        let path_translated = base_dir
+            .join(path_info.trim_start_matches('/'))
+            .to_string_lossy()
+            .to_string();
+        return Some((resolved, route, path_info, path_translated));
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1179,6 +1316,28 @@ fn handle_request(
     let resolved = match candidate.canonicalize() {
         Ok(p) if p == base_dir || p.starts_with(base_dir) => p,
         _ => {
+            if let Some((script_path, route, path_info, path_translated)) =
+                resolve_script_path_info(base_dir, &decoded, opts)
+            {
+                let handler = handler_type_for_route(base_dir, &script_path);
+                let outcome = dispatch_script(
+                    stream,
+                    base_dir,
+                    &script_path,
+                    &route,
+                    request,
+                    opts,
+                    body,
+                    client,
+                    head_only,
+                    keep_alive,
+                    stats,
+                    &path_info,
+                    &path_translated,
+                );
+                stats.record_handler(handler, handler_started.elapsed());
+                return outcome;
+            }
             stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
             stats.record_issue(
                 info::IssueKind::BrokenStaticRef,
@@ -1220,6 +1379,8 @@ fn handle_request(
                         head_only,
                         keep_alive,
                         stats,
+                        "",
+                        "",
                     );
                     stats.record_handler(handler, handler_started.elapsed());
                     return outcome;
@@ -1258,7 +1419,7 @@ fn handle_request(
         let handler = handler_type_for_route(base_dir, &resolved);
         let outcome = dispatch_script(
             stream, base_dir, &resolved, &route, request, opts, body, client, head_only,
-            keep_alive, stats,
+            keep_alive, stats, "", "",
         );
         stats.record_handler(handler, handler_started.elapsed());
         return outcome;
@@ -1456,10 +1617,14 @@ fn respond_script_failure(
 
 /// Executes a CGI/script request end-to-end (IDEA.md "Multi-language script
 /// execution" → "CGI 1.1 protocol semantics"): resolves the program to run
-/// (per `route`), builds the full CGI 1.1 environment, streams the request
-/// body to the child's stdin, captures stdout/stderr, and translates the
-/// script's CGI-style output into an HTTP response. No execution timeout —
-/// "No artificial resource limits" (IDEA.md "Security").
+/// (per `route`), builds the full CGI 1.1 environment — including
+/// `PATH_INFO`/`PATH_TRANSLATED` (CGI 1.1 §4.1.5/§4.1.6), threaded through
+/// from `handle_request`'s ancestor-prefix script resolution and empty for
+/// a request that names the script's own path with no extra trailing
+/// segments — streams the request body to the child's stdin, captures
+/// stdout/stderr, and translates the script's CGI-style output into an
+/// HTTP response. No execution timeout — "No artificial resource limits"
+/// (IDEA.md "Security").
 #[allow(clippy::too_many_arguments)]
 fn dispatch_script(
     stream: &mut Conn,
@@ -1473,6 +1638,8 @@ fn dispatch_script(
     head_only: bool,
     keep_alive: bool,
     stats: &info::Stats,
+    path_info: &str,
+    path_translated: &str,
 ) -> std::io::Result<(u16, u64)> {
     use std::process::{Command, Stdio};
 
@@ -1580,8 +1747,8 @@ fn dispatch_script(
     cmd.env("CONTENT_LENGTH", body.len().to_string());
     cmd.env("SCRIPT_NAME", &script_name);
     cmd.env("SCRIPT_FILENAME", script_path.to_string_lossy().to_string());
-    cmd.env("PATH_INFO", "");
-    cmd.env("PATH_TRANSLATED", "");
+    cmd.env("PATH_INFO", path_info);
+    cmd.env("PATH_TRANSLATED", path_translated);
     cmd.env(
         "SERVER_NAME",
         opts.fqdn.clone().unwrap_or_else(|| "localhost".to_string()),
@@ -2877,6 +3044,174 @@ mod tests {
         let response = request_over_loopback_opts(opts, "GET /thing.zz HTTP/1.1\r\n");
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(response.contains("cashttpd-definitely-not-a-real-binary is not installed"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chunked_request_body_decodes_split_chunks() {
+        let dir = unique_dir("chunked-body");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("echo.py");
+        fs::write(
+            &script,
+            "import sys\n\
+             body = sys.stdin.read()\n\
+             sys.stdout.write('Content-Type: text/plain\\r\\n\\r\\n')\n\
+             sys.stdout.write('got:' + body)\n",
+        )
+        .unwrap();
+
+        let opts = {
+            let mut o = test_opts(base_dir.clone());
+            o.script_handlers
+                .insert("py".to_string(), Some("python3".to_string()));
+            o
+        };
+
+        let request_line =
+            "POST /echo.py HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        // Body "pingpongfin" split across three chunks.
+        let chunked_body = b"4\r\nping\r\n4\r\npong\r\n3\r\nfin\r\n0\r\n\r\n";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
+        let stats = Arc::new(info::Stats::new("test"));
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(
+                Conn::Plain(stream),
+                &base_dir,
+                &opts,
+                &logger,
+                "127.0.0.1:1",
+                &stats,
+                &None,
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request_line.as_bytes()).unwrap();
+        client.write_all(chunked_body).unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        handle.join().unwrap();
+        let response = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("got:pingpongfin"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn malformed_chunked_body_closes_connection_cleanly() {
+        let dir = unique_dir("chunked-malformed");
+        fs::create_dir_all(&dir).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let request_line =
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = test_opts(base_dir.clone());
+        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
+        let stats = Arc::new(info::Stats::new("test"));
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Malformed framing must not panic; the helper closes the
+            // connection cleanly (same as a failed Content-Length read).
+            serve_connection(
+                Conn::Plain(stream),
+                &base_dir,
+                &opts,
+                &logger,
+                "127.0.0.1:1",
+                &stats,
+                &None,
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request_line.as_bytes()).unwrap();
+        // "zz" is not valid hex, so the chunk-size line is malformed.
+        client.write_all(b"zz\r\nbogus\r\n0\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        handle.join().unwrap();
+
+        assert!(buf.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_with_extra_path_segments_gets_path_info() {
+        let dir = unique_dir("path-info");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("cgi-bin").join("info.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\nprintf 'PI=%s PT=%s' \"$PATH_INFO\" \"$PATH_TRANSLATED\"\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&script, perms).unwrap();
+
+        let response =
+            request_over_loopback(&base_dir, "GET /cgi-bin/info.sh/extra/path HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let expected_translated = base_dir.join("extra/path");
+        assert!(response.contains(&format!(
+            "PI=/extra/path PT={}",
+            expected_translated.display()
+        )));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_with_no_extra_segments_gets_empty_path_info() {
+        let dir = unique_dir("path-info-empty");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+        let script = base_dir.join("cgi-bin").join("info.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\nprintf 'PI=[%s] PT=[%s]' \"$PATH_INFO\" \"$PATH_TRANSLATED\"\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&script, perms).unwrap();
+
+        let response = request_over_loopback(&base_dir, "GET /cgi-bin/info.sh HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("PI=[] PT=[]"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nonexistent_path_with_no_script_ancestor_still_404s() {
+        let dir = unique_dir("path-info-404");
+        fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(
+            &base_dir,
+            "GET /cgi-bin/does-not-exist.sh/extra HTTP/1.1\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 
         fs::remove_dir_all(&dir).ok();
     }
