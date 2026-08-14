@@ -22,7 +22,7 @@ fn run_with_args(args: &[String]) -> i32 {
             "cashttpd {} (commit {}, built {}){}",
             crate::support::version::VERSION,
             crate::support::version::COMMIT_ID,
-            crate::support::version::BUILD_DATE,
+            crate::support::version::build_date(),
             if crate::support::version::OFFICIAL_SITE.is_empty() {
                 String::new()
             } else {

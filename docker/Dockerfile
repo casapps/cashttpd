@@ -7,6 +7,14 @@ ARG PROJECT_ORG
 ARG PROJECT_NAME
 
 FROM casjaysdev/rust:latest AS builder
+# Build metadata (AI.md PART 6 "Build Metadata" / PART 5 "Build-Time
+# Metadata Args"): the caller captures BUILD_EPOCH once and derives
+# BUILD_DATE from it for the OCI-annotation build step; only BUILD_EPOCH
+# and COMMIT_ID are exported here, for build.rs to embed into the binary.
+ARG BUILD_EPOCH
+ARG COMMIT_ID
+ENV BUILD_EPOCH=${BUILD_EPOCH}
+ENV COMMIT_ID=${COMMIT_ID}
 WORKDIR /work
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl

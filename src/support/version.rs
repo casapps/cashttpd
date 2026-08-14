@@ -19,8 +19,32 @@ pub const COMMIT_ID: &str = match option_env!("APP_COMMIT_ID") {
     None => "N/A",
 };
 
-/// Build date embedded at build time, `"N/A"` when unavailable.
-pub const BUILD_DATE: &str = match option_env!("APP_BUILD_DATE") {
+/// Build epoch (Unix seconds, UTC) embedded at build time, `"0"` when unset.
+pub const BUILD_EPOCH: &str = match option_env!("APP_BUILD_EPOCH") {
     Some(v) => v,
-    None => "N/A",
+    None => "0",
 };
+
+/// Build date derived from `BUILD_EPOCH` (RFC 3339 UTC); `"N/A"` when unset.
+///
+/// Formatted by hand from `time::OffsetDateTime` field accessors rather than
+/// via the crate's `formatting` feature — `time` is already a dependency
+/// (`server::tls` certificate validity) and this avoids pulling in an extra
+/// feature/dependency surface for a single fixed-format timestamp.
+pub fn build_date() -> String {
+    match BUILD_EPOCH.parse::<i64>() {
+        Ok(n) if n > 0 => match time::OffsetDateTime::from_unix_timestamp(n) {
+            Ok(t) => format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                t.year(),
+                t.month() as u8,
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second()
+            ),
+            Err(_) => "N/A".into(),
+        },
+        _ => "N/A".into(),
+    }
+}

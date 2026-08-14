@@ -263,6 +263,30 @@ and `cargo-audit`'s own HTTP client succeed against the same hostname. Not a
 project configuration defect; expected to work on real CI runners. No
 action needed unless it reproduces on real GitHub/GitLab/Gitea/Forgejo CI.
 
+## [ ] Release workflow fixes are untested against a real tag push
+Read: AI.md PART 2 "Binary Model", PART 5 "Release Artifacts", PART 6
+"Build Metadata"
+This session fixed three `release.yml` (GitHub/Gitea/Forgejo) and
+`.gitlab-ci.yml`/`Jenkinsfile` bugs found during re-bootstrap
+reconciliation: (1) added `build.rs` + Dockerfile `ARG BUILD_EPOCH`/
+`ARG COMMIT_ID` wiring so `release.txt`/build metadata are actually
+embedded (previously `option_env!("APP_VERSION")` etc. were always unset —
+`release.txt` had zero effect); (2) replaced per-artifact `.sha256`
+sidecar files with the spec-required aggregate `sha256.txt`/`sha512.txt`;
+(3) fixed the Linux static-linkage check, which grepped `ldd` output for
+`'not a dynamic executable|statically linked'` — a pattern that does NOT
+match real musl static-pie `ldd` output (`/lib/ld-musl-x86_64.so.1
+(0x...)`, confirmed directly by building `x86_64-unknown-linux-musl`
+release inside `casjaysdev/rust:latest`), so the check would have silently
+never matched real output and always failed on an actual tag-triggered
+release run; now checks `file`'s `static-pie linked`/`statically linked`
+output instead. `act --list` validates the modified GitHub/Gitea/Forgejo
+YAML and `.gitlab-ci.yml` parses as valid YAML, and `--version` output was
+manually verified to contain the correct embedded version/commit/date
+inside the container, but none of these workflows have been exercised via
+an actual tag push in real CI (release.yml only triggers on `v*` tags) —
+verify on the next real release.
+
 ## [ ] Independently verify Gitea/Forgejo workflow provider compatibility
 Read: AI.md PART 10
 `.gitea/workflows/{ci,release}.yml` and `.forgejo/workflows/{ci,release}.yml`
@@ -273,6 +297,25 @@ not been run against a real Gitea or Forgejo instance. Verify `gh release
 create` (GitHub-CLI-specific, used in `release.yml`) has a working
 equivalent on those platforms' Actions runners, and that the pinned
 third-party action SHAs resolve there.
+
+## [ ] Container registry publish pipeline is not implemented
+Read: AI.md PART 5 "Docker Rule" ("docker-compose.yml — image:
+ghcr.io/{org}/{name}:latest", "OCI Annotations")
+No CI provider (`.github/`, `.gitea/`, `.forgejo/`, `.gitlab-ci.yml`,
+`Jenkinsfile`) currently builds and pushes `docker/Dockerfile` to a
+registry (`ghcr.io`/equivalent) — `grep -rl 'build-push-action\|ghcr.io\|
+docker push\|docker/login-action'` across every CI config returns nothing.
+`docker/Dockerfile` is currently built only for Trivy image scanning in
+`ci.yml` (never pushed), and `docker-compose.yml`/`docker-compose.dev.yml`
+reference `ghcr.io/{org}/{name}:latest`/`:devel` images that are never
+actually produced by CI. AI.md PART 5 requires OCI annotations via
+`docker/metadata-action` + `docker/build-push-action` with
+`provenance: false` and `annotations: ${{ steps.meta.outputs.annotations }}`
+when publishing — this needs a genuine publish job (or an explicit
+IDEA.md scope-out deciding binaries-only distribution is intentional) and
+was judged out of scope for this reconciliation pass given its size
+(multi-provider registry auth, image tagging, signing) and that it
+changes release behavior rather than fixing existing broken behavior.
 
 ## [x] AI.md PART 10's own `hashFiles()` job-level `if:` example is invalid
 Read: AI.md PART 10

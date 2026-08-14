@@ -176,7 +176,17 @@ pipeline {
                                     docker { image "${RUST_IMAGE}"; reuseNode true }
                                 }
                                 steps {
-                                    sh 'cargo build --release --target ${TARGET}'
+                                    // Single captured time source (AI.md PART 6 "Build
+                                    // Metadata") — BUILD_EPOCH is captured once per stage
+                                    // and, with COMMIT_ID, exported for build.rs to embed
+                                    // via APP_BUILD_EPOCH/APP_COMMIT_ID.
+                                    sh '''
+                                        set -euo pipefail
+                                        BUILD_EPOCH="$(date -u +%s)"
+                                        export BUILD_EPOCH
+                                        export COMMIT_ID="${GIT_COMMIT}"
+                                        cargo build --release --target ${TARGET}
+                                    '''
                                     sh '''
                                         set -euo pipefail
                                         mkdir -p binaries
@@ -193,7 +203,22 @@ pipeline {
                                           *)              BIN="cashttpd" ;;
                                         esac
                                         cp "target/$TARGET/release/$BIN" "binaries/$ARTIFACT"
-                                        sha256sum "binaries/$ARTIFACT" > "binaries/$ARTIFACT.sha256"
+                                        case "$TARGET" in
+                                          *-unknown-linux-musl)
+                                            # musl static-pie binaries self-reference their own
+                                            # musl loader stub in `ldd` output even though they
+                                            # have no external dynamic dependency — `file` is the
+                                            # authoritative static-linkage check.
+                                            ldd "target/$TARGET/release/cashttpd" 2>&1 || true
+                                            file "target/$TARGET/release/cashttpd" | grep -qE 'static-pie linked|statically linked'
+                                            ;;
+                                          *-apple-darwin)
+                                            otool -L "target/$TARGET/release/cashttpd"
+                                            ;;
+                                          *-pc-windows-*)
+                                            dumpbin /dependents "target/$TARGET/release/cashttpd.exe"
+                                            ;;
+                                        esac
                                     '''
                                     archiveArtifacts artifacts: 'binaries/*', fingerprint: true
                                 }
@@ -211,7 +236,16 @@ pipeline {
                         // License Compliance stage above — see its comment.
                         sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work cashttpd-toolchain:release -c "cargo cyclonedx --format json"'
                         sh 'cp bom.json binaries/cashttpd-bom.json'
-                        archiveArtifacts artifacts: 'binaries/cashttpd-bom.json', fingerprint: true
+                        // Two aggregate checksum files covering every published
+                        // artifact (AI.md PART 2 "Binary Model" / PART 5 "Release
+                        // Artifacts") — never per-artifact sidecar files.
+                        sh '''
+                            set -euo pipefail
+                            cd binaries
+                            sha256sum * > sha256.txt
+                            sha512sum * > sha512.txt
+                        '''
+                        archiveArtifacts artifacts: 'binaries/cashttpd-bom.json,binaries/sha256.txt,binaries/sha512.txt', fingerprint: true
                     }
                 }
             }

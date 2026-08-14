@@ -122,6 +122,12 @@ release-build:
           - aarch64-apple-darwin
   script:
     - set -euo pipefail
+    # Single captured time source (AI.md PART 6 "Build Metadata") — BUILD_EPOCH
+    # is captured once per job and, together with COMMIT_ID, exported for
+    # build.rs to embed via APP_BUILD_EPOCH/APP_COMMIT_ID.
+    - BUILD_EPOCH="$(date -u +%s)"
+    - export BUILD_EPOCH
+    - export COMMIT_ID="$CI_COMMIT_SHA"
     - cargo build --release --target "$TARGET"
     - mkdir -p binaries
     - |
@@ -139,7 +145,22 @@ release-build:
         *)              BIN="cashttpd" ;;
       esac
     - cp "target/$TARGET/release/$BIN" "binaries/$ARTIFACT"
-    - sha256sum "binaries/$ARTIFACT" > "binaries/$ARTIFACT.sha256"
+    - |
+      case "$TARGET" in
+        *-unknown-linux-musl)
+          # musl static-pie binaries self-reference their own musl loader
+          # stub in `ldd` output even though they have no external dynamic
+          # dependency — `file` is the authoritative static-linkage check.
+          ldd "target/$TARGET/release/cashttpd" 2>&1 || true
+          file "target/$TARGET/release/cashttpd" | grep -qE 'static-pie linked|statically linked'
+          ;;
+        *-apple-darwin)
+          otool -L "target/$TARGET/release/cashttpd"
+          ;;
+        *-pc-windows-*)
+          dumpbin /dependents "target/$TARGET/release/cashttpd.exe"
+          ;;
+      esac
   artifacts:
     paths:
       - binaries/
@@ -159,6 +180,10 @@ release-sbom:
     # toolchain:release is FROM casjaysdev/rust:latest — same ENTRYPOINT fix.
     - docker run --rm --entrypoint sh -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:release" -c 'cargo cyclonedx --format json'
     - cp bom.json "binaries/cashttpd-bom.json"
+    # Two aggregate checksum files covering every published artifact
+    # (AI.md PART 2 "Binary Model" / PART 5 "Release Artifacts") — never
+    # per-artifact sidecar files.
+    - (cd binaries && sha256sum * > sha256.txt && sha512sum * > sha512.txt)
   artifacts:
     paths:
       - binaries/

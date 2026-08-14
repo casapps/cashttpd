@@ -29,9 +29,20 @@ jobs:
       image: casjaysdev/rust:latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # commit metadata (COMMIT_ID below) needs the real HEAD sha
+          fetch-depth: 0
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        # Single captured time source (AI.md PART 6 "Build Metadata"):
+        # BUILD_EPOCH is captured once per job and, together with COMMIT_ID,
+        # exported for build.rs to embed via APP_BUILD_EPOCH/APP_COMMIT_ID.
+        run: |
+          set -euo pipefail
+          BUILD_EPOCH="$(date -u +%s)"
+          export BUILD_EPOCH
+          export COMMIT_ID="${GITHUB_SHA}"
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact
         env:
@@ -52,7 +63,6 @@ jobs:
             *)              BIN="cashttpd" ;;
           esac
           cp "target/$TARGET/release/$BIN" "binaries/$ARTIFACT"
-          sha256sum "binaries/$ARTIFACT" > "binaries/$ARTIFACT.sha256"
 
       - name: Verify static linkage
         env:
@@ -61,7 +71,13 @@ jobs:
           set -euo pipefail
           case "$TARGET" in
             *-unknown-linux-musl)
-              ldd "target/$TARGET/release/cashttpd" 2>&1 | grep -qE 'not a dynamic executable|statically linked'
+              # musl static-pie binaries self-reference their own musl
+              # loader stub in `ldd` output (e.g. `/lib/ld-musl-x86_64.so.1
+              # (0x...)`) even though they have no external dynamic
+              # dependency — `file` is the authoritative static-linkage
+              # check here; `ldd` is captured for the log but not gated on.
+              ldd "target/$TARGET/release/cashttpd" 2>&1 || true
+              file "target/$TARGET/release/cashttpd" | grep -qE 'static-pie linked|statically linked'
               ;;
             *-apple-darwin)
               otool -L "target/$TARGET/release/cashttpd"
@@ -133,6 +149,16 @@ jobs:
             --entrypoint sh \
             -v "$PWD":/work -w /work cashttpd-toolchain:release -c 'cargo cyclonedx --format json'
           cp bom.json "binaries/cashttpd-bom.json"
+
+      - name: Generate aggregate checksums
+        # Two aggregate checksum files covering every published artifact
+        # (AI.md PART 2 "Binary Model" / PART 5 "Release Artifacts") — never
+        # per-artifact sidecar files.
+        run: |
+          set -euo pipefail
+          cd binaries
+          sha256sum * > sha256.txt
+          sha512sum * > sha512.txt
 
       - name: Create GitHub release
         env:
