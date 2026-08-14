@@ -402,7 +402,7 @@ Distribution artifact names follow the schema:
 **Other rules:**
 - Local (in-tree) primary binary name: `{project_name}` (no platform/arch suffix during local development inside the Docker image)
 - If optional helper binaries exist, use `{project_name}-{tool}` for the in-tree name and `{project_name}-{tool}-{platform}-{arch}{.ext}` for distribution
-- Checksum files mirror the artifact name plus `.sha256` (e.g., `{project_name}-linux-amd64.sha256`)
+- Checksums are published as two aggregate files per release — `sha256.txt` and `sha512.txt` — covering every artifact in standard `sha256sum`/`sha512sum` format (`{hash}  {filename}` per line); never per-artifact sidecar files
 
 **Single-binary rule:** the default user experience is "download one file, run it." The primary binary MUST be self-sufficient (PART 0 → "Self-Contained Assets"). Helper binaries are not a substitute for putting features into the primary binary; if a feature can live behind a CLI subcommand of the primary binary, it MUST.
 
@@ -772,7 +772,7 @@ The `assets/` directory in the repo holds source files (fonts, icons, default th
 - Each release MUST publish artifacts for at minimum: `{project_name}-linux-amd64`, `{project_name}-linux-arm64`, `{project_name}-windows-amd64.exe`, `{project_name}-windows-arm64.exe`, `{project_name}-darwin-amd64`, `{project_name}-darwin-arm64` (subset acceptable only when IDEA.md narrows platform scope)
 - A static-linkage verification step is part of release: `ldd` / `otool -L` / `dumpbin /dependents` output is captured and checked against an allowlist (kernel vDSO, Apple system frameworks, Windows kernel32/user32 etc.) — anything outside the allowlist fails the release
 - No companion files (no `.so`, `.dylib`, `.dll`, no asset bundles, no font directories) ship next to the binary
-- Include SHA-256 checksums for every published artifact, named `{artifact}.sha256`
+- Include two aggregate checksum files covering every published artifact — `sha256.txt` (SHA-256) and `sha512.txt` (SHA-512), standard `{hash}  {filename}` format — uploaded as release assets; never per-artifact sidecar files
 - Include release notes that describe actual changes
 - Include an SBOM (always — generated via `cargo-cyclonedx`; see PART 10 → "Suggested CI Steps" for the invocation, PART 11 → "Required Tooling" for the tool pin). Include provenance/attestation via `actions/attest-build-provenance` when the release platform supports it; always set `provenance: false` on `docker/build-push-action` steps
 - If GUI packaging exists (MSI, DMG, AppImage, deb, rpm, etc.), the package wraps the same single static binary plus desktop integration metadata; package metadata lives in `packaging/`
@@ -841,6 +841,20 @@ All image metadata is applied as **OCI annotations at build time** — never as 
 - `docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0` MUST set `annotations: ${{ steps.meta.outputs.annotations }}`, `labels: ""` to suppress label output, AND `provenance: false` to prevent a spurious `unknown/unknown` platform entry in the manifest list (use `actions/attest-build-provenance` for release binary attestation instead)
 
 See `dockerfile_conventions.md` → "OCI Annotations" for the full required annotation set (`org.opencontainers.image.{title,description,url,source,documentation,vendor,authors,vcs-type,version,revision,created,licenses,...}`).
+
+### Build-Time Metadata Args
+
+`docker/Dockerfile` declares `ARG BUILD_EPOCH` in the builder stage and exports it as an environment variable for the `cargo build` step, so `build.rs` embeds it (PART 6 → "Build Metadata"). `ARG BUILD_DATE` is declared only where it feeds the `org.opencontainers.image.created` value — it is never passed to the cargo build. The caller captures `BUILD_EPOCH` once, derives `BUILD_DATE` from it, and passes both:
+
+```bash
+# Captured ONCE; BUILD_DATE is derived from it, never independently captured
+BUILD_EPOCH="$(date -u +%s)"
+BUILD_DATE="$(date -u -d "@${BUILD_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)"
+docker build -f docker/Dockerfile \
+  --build-arg BUILD_EPOCH="$BUILD_EPOCH" \
+  --build-arg BUILD_DATE="$BUILD_DATE" \
+  ...
+```
 
 ### Container Runtime Rules
 
@@ -988,12 +1002,31 @@ docker run --rm \
 Embed at build time when practical:
 - version
 - commit ID
-- build date
+- build epoch (Unix seconds, UTC — the build date is derived from it at runtime)
 - official site (optional)
 
-**Example `build.rs` pattern:**
+**Single captured time source — `BUILD_EPOCH`:** every build path (local script, Makefile, Dockerfile, CI job) captures the build time exactly once, as Unix seconds UTC, and derives everything else from it:
+
+```bash
+# Captured ONCE per build; every other time value derives from this
+BUILD_EPOCH="$(date -u +%s)"
+```
+
+Makefile form (the derived `BUILD_DATE` line sits immediately after the capture):
+
+```makefile
+# Captured ONCE per build; every other time value derives from this
+BUILD_EPOCH := $(shell date -u +%s)
+# ISO 8601 UTC, derived from BUILD_EPOCH (docker build-arg / OCI label use only)
+BUILD_DATE := $(shell date -u -d @$(BUILD_EPOCH) +"%Y-%m-%dT%H:%M:%SZ")
+```
+
+`BUILD_DATE` is never independently captured — it exists only where a Docker build needs the `org.opencontainers.image.created` label (`--build-arg BUILD_DATE=`), derived as `BUILD_DATE="$(date -u -d "@${BUILD_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)"`. The app itself never receives `BUILD_DATE`; it derives the date from the embedded epoch via `build_date()` below.
+
+**Example `build.rs` pattern** — the build environment exports `COMMIT_ID` and `BUILD_EPOCH`; `build.rs` maps them (plus the metadata files) to the `APP_*` variables `option_env!()` reads:
+
 ```rust
-use std::{fs, path::Path};
+use std::{env, fs, path::Path};
 
 fn main() {
     // Re-run this build script when either metadata file changes, otherwise
@@ -1010,15 +1043,34 @@ fn main() {
         let site = fs::read_to_string("site.txt").unwrap();
         println!("cargo:rustc-env=APP_OFFICIAL_SITE={}", site.trim());
     }
+
+    // Map build-environment variables to the APP_* names option_env!() reads.
+    // BUILD_DATE is deliberately NOT mapped - the app derives it from BUILD_EPOCH.
+    for (src, dst) in [("COMMIT_ID", "APP_COMMIT_ID"), ("BUILD_EPOCH", "APP_BUILD_EPOCH")] {
+        println!("cargo:rerun-if-env-changed={}", src);
+        if let Ok(val) = env::var(src) {
+            println!("cargo:rustc-env={}={}", dst, val.trim());
+        }
+    }
 }
 ```
 
-**Example runtime constants:**
+**Example runtime constants** (`build_date()` uses `chrono` — an approved pure-Rust date/time crate, PART 5 → "Pure-Rust Library Stack"; add `chrono = "0.4"` to `[dependencies]`):
 ```rust
 pub const VERSION: &str = option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
 pub const OFFICIAL_SITE: &str = option_env!("APP_OFFICIAL_SITE").unwrap_or("");
 pub const COMMIT_ID: &str = option_env!("APP_COMMIT_ID").unwrap_or("N/A");
-pub const BUILD_DATE: &str = option_env!("APP_BUILD_DATE").unwrap_or("N/A");
+pub const BUILD_EPOCH: &str = option_env!("APP_BUILD_EPOCH").unwrap_or("0");
+
+// Build date derived from BUILD_EPOCH (RFC 3339 UTC); "N/A" when unset
+pub fn build_date() -> String {
+    match BUILD_EPOCH.parse::<i64>() {
+        Ok(n) if n > 0 => chrono::DateTime::from_timestamp(n, 0)
+            .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "N/A".into()),
+        _ => "N/A".into(),
+    }
+}
 ```
 
 ---
@@ -1391,7 +1443,8 @@ No hidden telemetry. Any analytics, crash reporting, or update pings must be doc
 | No unsafe fork secrets | Fork PRs do not receive secrets or publish permissions |
 | Version precedence | `release.txt` wins when present |
 | Site precedence | `site.txt` wins when present |
-| Verifiable outputs | Releases publish checksums and an SBOM (always); provenance/attestation when the platform supports it |
+| Verifiable outputs | Releases publish aggregate `sha256.txt` / `sha512.txt` checksum files and an SBOM (always); provenance/attestation when the platform supports it |
+| Single build time source | Every build job — on every provider (GitHub Actions, Gitea/Forgejo, GitLab CI, Jenkins) — captures `BUILD_EPOCH="$(date -u +%s)"` exactly once and exports it to the build environment so `build.rs` embeds it (PART 6). `BUILD_DATE` is never independently captured; where a Docker build needs the OCI `image.created` label, derive it (`date -u -d "@${BUILD_EPOCH}" +%Y-%m-%dT%H:%M:%SZ`) and pass both via `--build-arg BUILD_EPOCH=` / `--build-arg BUILD_DATE=` |
 | No Makefile in CI | Workflow `run:` steps invoke explicit commands with all environment variables inlined — never `make {target}`. The Makefile is for local developer convenience only. CI MUST NOT depend on Makefile targets that could drift silently. |
 | Portability | No hardcoded org, project name, official site, or registry value anywhere in workflows. Use `${{ github.repository_owner }}` / `${{ github.event.repository.name }}` (and provider equivalents). Workflows must keep working after a fork without editing values. |
 | Renovate only | `renovate.json` at repo root is the only supported dependency-update tool — it covers GitHub Actions SHAs, Docker image digests, Cargo deps, and works across all five providers from a single config. Dependabot is **forbidden** (GitHub-only; duplicates Renovate on GitHub; cannot serve the other four providers). |
@@ -1541,23 +1594,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  detect:
-    runs-on: ubuntu-latest
-    outputs:
-      has_cargo_lock: ${{ steps.detect.outputs.has_cargo_lock }}
-      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - id: detect
-        # `hashFiles()` cannot be used in a job-level `if:` — that condition
-        # is evaluated before a runner is assigned and the repo checked out,
-        # so it can never see the working tree (confirmed against a real CI
-        # run: the gated job never scheduled). Detect file presence here
-        # instead and pass the result via job outputs.
-        run: |
-          echo "has_cargo_lock=$([ -f Cargo.lock ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "has_dockerfile=$([ -f docker/Dockerfile ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
   secret-scan:
     runs-on: ubuntu-latest
     steps:
@@ -1566,30 +1602,25 @@ jobs:
           # required: truffleHog needs full history
           fetch-depth: 0
 
+      # Empty base/head = full-history scan (schedule runs and new-branch pushes)
       - name: Determine scan range
-        id: scan-range
-        # `github.event.before` is the all-zero SHA on a new branch's first
-        # push and is unset entirely on `schedule` runs, which breaks
-        # TruffleHog's diff scan. Resolve base/head explicitly per event
-        # type instead of passing the raw context values straight through.
+        id: range
         run: |
-          zero="0000000000000000000000000000000000000000"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "$zero" ]; then
-            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
-            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "base=" >> "$GITHUB_OUTPUT"
-            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          BASE=""; HEAD=""
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE="${{ github.event.before }}"; HEAD="${{ github.sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"; HEAD="${{ github.event.pull_request.head.sha }}"
           fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
 
       - name: TruffleHog secret scan
-        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11  # v3.96.0
+        uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55  # v3.95.9
         with:
-          base: ${{ steps.scan-range.outputs.base }}
-          head: ${{ steps.scan-range.outputs.head }}
+          # NEVER use default_branch — it resolves to HEAD post-push and skips the scan
+          base: ${{ steps.range.outputs.base }}
+          head: ${{ steps.range.outputs.head }}
           extra_args: --results=verified,unknown
 
   workflow-policy:
@@ -1599,13 +1630,7 @@ jobs:
       - name: Verify all third-party actions are pinned to a 40-char SHA
         run: |
           set -eo pipefail
-          # `@(v?[0-9]|main|master)` also matches a real 40-char SHA that
-          # happens to start with a decimal digit (e.g. `@76071ef0...`),
-          # producing false positives — confirmed via a real CI run.
-          # Extract each `uses:` ref and reject only refs that are NOT a
-          # full 40-char hex SHA.
-          bad=$(grep -RhnoE '^\s*uses:\s*[^@]+@[^[:space:]]+' .github/ .gitea/ .forgejo/ 2>/dev/null \
-                | grep -vE '@[0-9a-fA-F]{40}$' || true)
+          bad=$(grep -RnE '^[[:space:]]*uses:' .github/ .gitea/ .forgejo/ 2>/dev/null | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' || true)
           if [[ -n "$bad" ]]; then
             echo "::error::Unpinned actions found (must be 40-char SHAs):"
             echo "$bad"
@@ -1613,30 +1638,31 @@ jobs:
           fi
 
   vuln-scan:
-    needs: detect
     runs-on: ubuntu-latest
-    if: ${{ needs.detect.outputs.has_cargo_lock == 'true' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # step-level gate: hashFiles() is not valid in a job-level if
       - name: cargo audit (inside casjaysdev/rust:latest)
+        if: hashFiles('Cargo.lock') != ''
         run: |
           IMAGE="casjaysdev/rust:latest"
           docker run --rm -i \
             --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
-            --entrypoint sh \
-            -v "$PWD":/work -w /work "$IMAGE" -c 'cargo audit'
+            -v "$PWD":/work -w /work "$IMAGE" cargo audit
 
   image-scan:
-    needs: detect
     runs-on: ubuntu-latest
-    if: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # step-level gates: hashFiles() is not valid in a job-level if
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        if: hashFiles('docker/Dockerfile') != ''
       - name: Build local image for scanning
+        if: hashFiles('docker/Dockerfile') != ''
         run: |
           docker build -f docker/Dockerfile -t scan-target:ci .
       - name: Trivy image scan
+        if: hashFiles('docker/Dockerfile') != ''
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: scan-target:ci
@@ -1676,8 +1702,23 @@ jobs:
       image: casjaysdev/rust:latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Capture build epoch
+        run: |
+          # Captured ONCE per job - every other time value derives from this
+          BUILD_EPOCH=$(date -u +%s)
+          echo "BUILD_EPOCH=$BUILD_EPOCH" >> $GITHUB_ENV
       - run: cargo build --release
+        env:
+          BUILD_EPOCH: ${{ env.BUILD_EPOCH }}
 ```
+
+The same capture-once pattern applies on every provider:
+
+- **Gitea / Forgejo**: identical to GitHub Actions (`$GITHUB_ENV` is supported by the act runner)
+- **GitLab CI**: capture at the top of the job's `script:` — `export BUILD_EPOCH="$(date -u +%s)"` — before any build command; all later commands in the job reuse it
+- **Jenkins**: capture once per pipeline in `environment {}` — `BUILD_EPOCH = sh(script: 'date -u +%s', returnStdout: true).trim()` — and reference `${env.BUILD_EPOCH}` in every stage
+
+Where a job builds a Docker image, derive `BUILD_DATE` from the captured epoch for the OCI `image.created` label only — e.g. `echo "BUILD_DATE=$(date -u -d @$BUILD_EPOCH +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV` — and pass `--build-arg BUILD_EPOCH=` plus `--build-arg BUILD_DATE=`. The cargo build consumes `BUILD_EPOCH`, never `BUILD_DATE`.
 
 ### Required Concurrency and Retention Headers
 
@@ -1706,6 +1747,9 @@ Every `actions/upload-artifact` step MUST set a finite `retention-days`:
 # Prepare output directory for release artifacts (binaries, checksums, SBOM)
 mkdir -p binaries
 
+# Captured ONCE per job - every other time value derives from this (PART 6)
+BUILD_EPOCH="$(date -u +%s)"
+
 # Run gates inside the image (casjaysdev/rust:latest — all tools pre-installed)
 docker run --rm --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" -v "$PWD":/work -w /work "$PROJECT_IMAGE" cargo fmt --check
 docker run --rm --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" -v "$PWD":/work -w /work "$PROJECT_IMAGE" cargo clippy -- -D warnings
@@ -1733,6 +1777,7 @@ for TARGET in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
               x86_64-apple-darwin aarch64-apple-darwin; do
   docker run --rm \
     --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+    -e BUILD_EPOCH="$BUILD_EPOCH" \
     -v "$PWD":/work -w /work "$PROJECT_IMAGE" \
     cargo build --release --target "$TARGET"
 
@@ -1752,7 +1797,6 @@ for TARGET in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
     *)              BIN="{project_name}" ;;
   esac
   cp "target/$TARGET/release/$BIN" "binaries/$ARTIFACT"
-  sha256sum "binaries/$ARTIFACT" > "binaries/$ARTIFACT.sha256"
 
   # Verify static/expected linkage for this target — fails the build if
   # unexpected dynamic deps appear. Use the appropriate inspector per target family:
@@ -1781,6 +1825,16 @@ done
 docker run --rm --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" -v "$PWD":/work -w /work "$PROJECT_IMAGE" \
   cargo cyclonedx --format json
 cp bom.json "binaries/{project_name}-bom.json"
+
+# Aggregate checksums over every release asset, generated last so the SBOM is
+# included. The file list is captured first so the checksum files never hash
+# themselves. Both files are uploaded as release assets.
+WORKDIR="$PWD"
+cd "$WORKDIR/binaries"
+FILES="$(ls)"
+sha256sum $FILES > sha256.txt
+sha512sum $FILES > sha512.txt
+cd "$WORKDIR"
 ```
 
 For GUI smoke tests in CI, use a virtual X server (e.g., `Xvfb`) and a headless Wayland compositor (e.g., `cage`, `weston --backend=headless`) **inside** the container or as a sidecar service — both backends MUST be exercised, not just one.
@@ -1832,7 +1886,7 @@ The `release` job already has `contents: write` to push assets — this covers t
 
 Tagged/manual releases should publish:
 - binaries/packages
-- SHA-256 checksum file
+- aggregate `sha256.txt` and `sha512.txt` checksum files covering every asset
 - release notes
 - SBOM (`CycloneDX` from `cargo-cyclonedx`; `SPDX JSON` is acceptable if a project chooses that format instead) — always
 - provenance / attestation — when the release platform supports it
@@ -1899,7 +1953,7 @@ Never use a GitHub Actions badge for a GitLab or Gitea project — the CI badge 
 [![Docs](https://readthedocs.org/projects/{RTD_PROJECT}/badge/?version=latest)](https://{RTD_URL})
 
 # Gitea/Forgejo (use shields.io with custom endpoint or static badge)
-[![Release](https://img.shields.io/badge/dynamic/json?url=https://git.example.com/api/{api_version}/repos/{project_org}/{project_name}/releases/latest&query=$.tag_name&label=release)](https://git.example.com/{project_org}/{project_name}/releases)
+[![Release](https://img.shields.io/badge/dynamic/json?url=https://git.example.com/api/v1/repos/{project_org}/{project_name}/releases/latest&query=$.tag_name&label=release)](https://git.example.com/{project_org}/{project_name}/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 [![Docs](https://readthedocs.org/projects/{RTD_PROJECT}/badge/?version=latest)](https://{RTD_URL})
 
@@ -2048,7 +2102,7 @@ Embedded license data MUST be reachable by the user at runtime, not just shipped
 - **TUI**: a "Licenses" / "Credits" entry in the help / about screen, scrollable
 - **GUI**: an "About → Open Source Licenses" entry that opens a scrollable view of the full text
 
-All three surfaces read the same `LICENSE.md` blob embedded at compile time via `include_str!` (PART 0 → "Self-Contained Assets"). The version, commit ID, and build date (PART 6) are shown alongside.
+All three surfaces read the same `LICENSE.md` blob embedded at compile time via `include_str!` (PART 0 → "Self-Contained Assets"). The version, commit ID, and build date (derived from `BUILD_EPOCH` via `build_date()`, PART 6) are shown alongside.
 
 ### CI Gate (mandatory)
 
@@ -2143,7 +2197,7 @@ All gates run inside the project Docker image — never on the host.
 - [ ] Version comes from `release.txt` when present
 - [ ] Official site comes from `site.txt` when present
 - [ ] Release notes match actual changes
-- [ ] Checksums (SHA-256) are published for every artifact
+- [ ] Aggregate `sha256.txt` and `sha512.txt` checksum files covering every artifact are published as release assets
 - [ ] Each release artifact is a single statically linked binary — no companion `.so` / `.dylib` / `.dll` / asset bundle
 - [ ] Static-linkage check (`ldd` / `otool -L` / `dumpbin /dependents`) was run and recorded for every published target
 - [ ] `LICENSE.md` regenerated and committed if `Cargo.lock` changed; CI license-drift check is green
