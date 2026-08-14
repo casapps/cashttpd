@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
         # smtp server", exit code 1). `--entrypoint sh -c '...'` bypasses it.
         run: |
           docker run --rm \
-            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
             -v "$PWD":/work -w /work casjaysdev/rust:latest \
             -c 'cargo deny check licenses advisories bans sources'
@@ -100,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm \
-            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
             -v "$PWD":/work -w /work cashttpd-toolchain:ci \
             -c 'cargo about generate about.hbs' > LICENSE.generated.md
@@ -143,13 +143,30 @@ jobs:
         with:
           # required: truffleHog needs full history
           fetch-depth: 0
+      - name: Determine scan range
+        id: scan-range
+        # `github.event.before` is the all-zero SHA on a new branch's first
+        # push and is unset entirely on `schedule` runs, which breaks
+        # TruffleHog's diff scan. Resolve base/head explicitly per event
+        # type instead of passing the raw context values straight through.
+        run: |
+          zero="0000000000000000000000000000000000000000"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "$zero" ]; then
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
       - name: TruffleHog secret scan
         uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11  # v3.96.0
         with:
-          # NEVER use default_branch — it resolves to HEAD post-push and skips the scan
-          base: ${{ github.event.before }}
-          head: ${{ github.sha }}
-          extra_args: --only-verified
+          base: ${{ steps.scan-range.outputs.base }}
+          head: ${{ steps.scan-range.outputs.head }}
+          extra_args: --results=verified,unknown
 
   workflow-policy:
     runs-on: ubuntu-latest
@@ -184,7 +201,7 @@ jobs:
         run: |
           IMAGE="casjaysdev/rust:latest"
           docker run --rm -i \
-            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
             -v "$PWD":/work -w /work "$IMAGE" -c 'cargo audit'
 
@@ -194,7 +211,7 @@ jobs:
     if: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
       - name: Build local image for scanning
         run: |
           docker build -f docker/Dockerfile -t scan-target:ci .

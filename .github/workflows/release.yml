@@ -129,7 +129,7 @@ jobs:
           # inherits the same default-ENTRYPOINT interception issue — see the
           # identical fix and rationale in ci.yml's license-compliance job.
           docker run --rm \
-            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
             -v "$PWD":/work -w /work cashttpd-toolchain:release -c 'cargo cyclonedx --format json'
           cp bom.json "binaries/cashttpd-bom.json"

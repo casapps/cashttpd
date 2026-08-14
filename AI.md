@@ -1537,10 +1537,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_cargo_lock: ${{ steps.detect.outputs.has_cargo_lock }}
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - id: detect
+        # `hashFiles()` cannot be used in a job-level `if:` — that condition
+        # is evaluated before a runner is assigned and the repo checked out,
+        # so it can never see the working tree (confirmed against a real CI
+        # run: the gated job never scheduled). Detect file presence here
+        # instead and pass the result via job outputs.
+        run: |
+          echo "has_cargo_lock=$([ -f Cargo.lock ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_dockerfile=$([ -f docker/Dockerfile ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:
@@ -1549,13 +1566,31 @@ jobs:
           # required: truffleHog needs full history
           fetch-depth: 0
 
+      - name: Determine scan range
+        id: scan-range
+        # `github.event.before` is the all-zero SHA on a new branch's first
+        # push and is unset entirely on `schedule` runs, which breaks
+        # TruffleHog's diff scan. Resolve base/head explicitly per event
+        # type instead of passing the raw context values straight through.
+        run: |
+          zero="0000000000000000000000000000000000000000"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "$zero" ]; then
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: TruffleHog secret scan
-        uses: trufflesecurity/trufflehog@b634fb72d9901a4f942e5b8e4ef5f7ec59c97e7c  # v3.88.2
+        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11  # v3.96.0
         with:
-          # NEVER use default_branch — it resolves to HEAD post-push and skips the scan
-          base: ${{ github.event.before }}
-          head: ${{ github.sha }}
-          extra_args: --only-verified
+          base: ${{ steps.scan-range.outputs.base }}
+          head: ${{ steps.scan-range.outputs.head }}
+          extra_args: --results=verified,unknown
 
   workflow-policy:
     runs-on: ubuntu-latest
@@ -1564,7 +1599,13 @@ jobs:
       - name: Verify all third-party actions are pinned to a 40-char SHA
         run: |
           set -eo pipefail
-          bad=$(grep -RhnE '^\s*uses:\s*[^@]+@(v?[0-9]|main|master)' .github/ .gitea/ .forgejo/ 2>/dev/null || true)
+          # `@(v?[0-9]|main|master)` also matches a real 40-char SHA that
+          # happens to start with a decimal digit (e.g. `@76071ef0...`),
+          # producing false positives — confirmed via a real CI run.
+          # Extract each `uses:` ref and reject only refs that are NOT a
+          # full 40-char hex SHA.
+          bad=$(grep -RhnoE '^\s*uses:\s*[^@]+@[^[:space:]]+' .github/ .gitea/ .forgejo/ 2>/dev/null \
+                | grep -vE '@[0-9a-fA-F]{40}$' || true)
           if [[ -n "$bad" ]]; then
             echo "::error::Unpinned actions found (must be 40-char SHAs):"
             echo "$bad"
@@ -1572,28 +1613,31 @@ jobs:
           fi
 
   vuln-scan:
+    needs: detect
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('Cargo.lock') != '' }}
+    if: ${{ needs.detect.outputs.has_cargo_lock == 'true' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: cargo audit (inside casjaysdev/rust:latest)
         run: |
           IMAGE="casjaysdev/rust:latest"
           docker run --rm -i \
-            --name "${{ github.event.repository.name }}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
-            -v "$PWD":/work -w /work "$IMAGE" cargo audit
+            --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+            --entrypoint sh \
+            -v "$PWD":/work -w /work "$IMAGE" -c 'cargo audit'
 
   image-scan:
+    needs: detect
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('docker/Dockerfile') != '' }}
+    if: ${{ needs.detect.outputs.has_dockerfile == 'true' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
       - name: Build local image for scanning
         run: |
           docker build -f docker/Dockerfile -t scan-target:ci .
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37  # v0.70.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: scan-target:ci
           severity: CRITICAL,HIGH

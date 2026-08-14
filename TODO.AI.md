@@ -274,19 +274,23 @@ create` (GitHub-CLI-specific, used in `release.yml`) has a working
 equivalent on those platforms' Actions runners, and that the pinned
 third-party action SHAs resolve there.
 
-## [ ] AI.md PART 10's own `hashFiles()` job-level `if:` example is invalid
+## [x] AI.md PART 10's own `hashFiles()` job-level `if:` example is invalid
 Read: AI.md PART 10
-AI.md's canonical "Security Jobs in ci.yml Example" uses
-`if: ${{ hashFiles('Cargo.lock') != '' }}` at the job level for `vuln-scan`
-and `image-scan`. Verified via a real GitHub Actions run
-(github.com/casapps/cashttpd, run 31670043840) that this fails to schedule
-any jobs at all — GitHub Actions evaluates job-level `if:` before a runner
-is assigned and the repo is checked out, so `hashFiles()` has no filesystem
-to read at that point. This is not a local `act`-only limitation as
-previously assumed; it is invalid on real GitHub Actions. Fixed in this
-project by adding a `detect` job that checks out the repo and exposes
-`has_cargo_lock`/`has_dockerfile` as job outputs, which `vuln-scan`/
-`image-scan` then reference via `needs.detect.outputs.*` instead. Flagging
-here because AI.md PART 10 still documents the broken pattern as canonical
-— worth raising upstream so other projects bootstrapped from this spec
-don't repeat the same real-CI failure.
+Fixed upstream in the `claudemgr` `rust/APPLICATION.md` template (commit
+`6af51c9f273e`), which moved the `hashFiles()` gate from job-level `if:` to
+step-level `if:` inside `vuln-scan`/`image-scan` (valid there because
+`actions/checkout` has already run as an earlier step in the same job).
+cashttpd's own fix predates and differs from upstream's: a `detect` job that
+checks out the repo and exposes `has_cargo_lock`/`has_dockerfile` as job
+outputs, which `vuln-scan`/`image-scan` then reference via
+`needs.detect.outputs.*`. Both patterns are valid; cashttpd keeps its
+`detect`-job approach rather than switching to upstream's step-level-if,
+since it was already implemented, tested, and green in real CI. AI.md
+PART 10's canonical "Security Jobs in ci.yml Example" has been updated to
+document the `detect`-job pattern actually in use, replacing the broken
+job-level `hashFiles()` example. The same upstream commit's other fixes
+(concurrency-group event_name suffix, `$(basename "$GITHUB_REPOSITORY")`
+container naming, `docker/setup-buildx-action` v4.1.0 bump, TruffleHog
+scan-range step + `--results=verified,unknown`) were cross-checked and
+ported into `.github/`, `.gitea/`, and `.forgejo/` `ci.yml`/`release.yml`
+where applicable.
