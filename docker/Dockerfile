@@ -39,7 +39,18 @@ FROM alpine:latest AS runtime
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-RUN apk add --no-cache tini ca-certificates
+RUN apk add --no-cache tini ca-certificates \
+    php84 php84-cgi python3 perl lua5.4 ruby tor \
+ && ln -s /usr/bin/php-cgi84 /usr/local/bin/php-cgi \
+ && ln -s /usr/bin/lua5.4 /usr/local/bin/lua
+# Alpine only ships versioned php/php-cgi and lua binaries (php84/php-cgi84,
+# lua5.4) — symlinked to the unversioned names IDEA.md's built-in
+# `script_handlers` table expects (`php-cgi`, `lua`) so multi-language
+# script execution works with zero config, matching the "first run works
+# with zero configuration" requirement. python3/perl/ruby already match the
+# built-in table's command names as installed, no symlink needed. `tor` is
+# installed for local dev use (e.g. onion-service/proxy testing) but is not
+# started automatically — cashttpd itself never launches it.
 
 COPY --from=builder /out/cashttpd /usr/local/bin/cashttpd
 COPY docker/rootfs/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh

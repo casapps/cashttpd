@@ -46,6 +46,37 @@ Then from the host:
 curl -v http://localhost:59123/
 ```
 
+## Base-dir auto-detection
+
+`docker/rootfs/usr/local/bin/entrypoint.sh` picks a `--dir` automatically
+when the caller doesn't pass one explicitly, checking these mount points in
+priority order and using the first one that exists: `/site`, `/app`,
+`/root/site`, `/data/htdocs`. If none exist, `/site` is created and used.
+Mount your project at whichever of those four paths you prefer:
+
+```bash
+docker run --rm \
+  --name "${PROJECT_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
+  -p 127.0.0.1:59123:59123 \
+  -v "$PWD":/site:ro \
+  "$PROJECT_IMAGE" --listen ::1 --port 59123
+```
+
+This is a container-only convenience — it does not change cashttpd's own
+`--dir` default of `.` (current working directory) when run directly
+outside a container (IDEA.md "Core behavior"). Passing `--dir` explicitly,
+as in the previous example, always overrides auto-detection.
+
+## Installed interpreters and tools
+
+The runtime image ships PHP (`php-cgi`), Python 3 (`python3`), Perl
+(`perl`), Lua (`lua`), and Ruby (`ruby`) so multi-language script execution
+(IDEA.md "Multi-language script execution") works with zero extra setup —
+`php-cgi` and `lua` are symlinks to Alpine's versioned package binaries
+(`php-cgi84`, `lua5.4`) so the built-in `script_handlers` table resolves
+them by their unversioned names. `tor` is also installed for local
+proxy/onion-service testing; cashttpd never starts it automatically.
+
 ## Development image
 
 ```bash

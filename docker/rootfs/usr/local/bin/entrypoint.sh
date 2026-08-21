@@ -15,4 +15,31 @@ case "$1" in
   *) set -- cashttpd "$@" ;;
 esac
 
+# Container-only base-dir default: unless the caller already passed --dir
+# explicitly, auto-detect which of the documented mount points was used and
+# hand it to cashttpd's --dir flag. This is purely a container convenience —
+# it does not change cashttpd's own default (IDEA.md "Core behavior": --dir
+# defaults to "." when run directly, outside a container). Checked in this
+# priority order; first one that exists wins; /site is created and used if
+# none of them exist.
+has_dir_flag=0
+for arg in "$@"; do
+  case "$arg" in
+    --dir | --dir=*) has_dir_flag=1 ;;
+  esac
+done
+
+if [ "$has_dir_flag" -eq 0 ] && [ "$1" = "cashttpd" ]; then
+  base_dir=""
+  for candidate in /site /app /root/site /data/htdocs; do
+    if [ -d "$candidate" ]; then
+      base_dir="$candidate"
+      break
+    fi
+  done
+  [ -n "$base_dir" ] || { base_dir="/site"; mkdir -p "$base_dir"; }
+  shift
+  set -- cashttpd --dir "$base_dir" "$@"
+fi
+
 exec "$@"

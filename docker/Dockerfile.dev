@@ -27,7 +27,12 @@ FROM alpine:latest AS runtime
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-RUN apk add --no-cache tini ca-certificates
+RUN apk add --no-cache tini ca-certificates \
+    php84 php84-cgi python3 perl lua5.4 ruby tor \
+ && ln -s /usr/bin/php-cgi84 /usr/local/bin/php-cgi \
+ && ln -s /usr/bin/lua5.4 /usr/local/bin/lua
+# See docker/Dockerfile for why these packages/symlinks are needed —
+# same runtime stage shape, kept in sync deliberately.
 
 COPY --from=builder /out/cashttpd /usr/local/bin/cashttpd
 COPY docker/rootfs/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
