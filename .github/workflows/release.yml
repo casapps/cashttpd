@@ -175,3 +175,103 @@ jobs:
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068c3c56  # v3.0.0
         with:
           subject-path: binaries/cashttpd-*
+
+  publish-image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # push the runtime image to the provider's container registry
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # the image revision annotation needs the real HEAD sha
+          fetch-depth: 0
+
+      - name: Resolve registry, image name, and build metadata
+        id: image
+        # No hardcoded org, project name, or registry value (AI.md PART 5
+        # "Portability Rule") — everything is derived from the provider
+        # context so the workflow keeps working after a fork. GitHub's own
+        # container registry is ghcr.io; every other provider (Gitea,
+        # Forgejo) serves its package registry from the instance host.
+        run: |
+          set -euo pipefail
+          host="$(printf '%s' "${{ github.server_url }}" | sed -E 's#^https?://##; s#/$##')"
+          case "$host" in
+            github.com) registry="ghcr.io" ;;
+            *)          registry="$host" ;;
+          esac
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          name="$(printf '%s' "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')"
+          # release.txt wins when present (AI.md PART 10 "Version precedence")
+          if [ -s release.txt ]; then
+            version="$(tr -d '[:space:]' < release.txt)"
+          else
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+          # Captured ONCE; BUILD_DATE is derived from it, never independently
+          # captured (AI.md PART 6 "Build Metadata").
+          build_epoch="$(date -u +%s)"
+          {
+            echo "registry=$registry"
+            echo "image=$registry/$owner/$name"
+            echo "version=$version"
+            echo "build_epoch=$build_epoch"
+            echo "build_date=$(date -u -d "@$build_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The Rust compile runs natively in the builder stage; QEMU is needed
+      # only for the small Alpine runtime stage on linux/arm64.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ steps.image.outputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
+        id: meta
+        with:
+          images: ${{ steps.image.outputs.image }}
+          annotations: |
+            maintainer=${{ github.repository_owner }} <${{ github.repository_owner }}@casjay.pro>
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.authors=${{ github.repository_owner }}
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.base.name=${{ github.event.repository.name }}
+            org.opencontainers.image.description=Containerized version of ${{ github.event.repository.name }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.documentation=${{ github.event.repository.html_url }}
+            org.opencontainers.image.vcs-type=Git
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.created=${{ steps.image.outputs.build_date }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+            org.opencontainers.image.schema-version=${{ steps.image.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            com.github.containers.toolbox=false
+
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image }}:latest
+            ${{ steps.image.outputs.image }}:${{ steps.image.outputs.version }}
+          build-args: |
+            BUILD_EPOCH=${{ steps.image.outputs.build_epoch }}
+            COMMIT_ID=${{ github.sha }}
+            PROJECT_ORG=${{ github.repository_owner }}
+            PROJECT_NAME=${{ github.event.repository.name }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          # annotations only — no LABEL blocks and no label output
+          # (AI.md PART 5 "OCI Annotations (No LABEL Policy)")
+          labels: ""
+          # prevents a spurious unknown/unknown platform entry in the
+          # manifest list; binary provenance is attested separately above
+          provenance: false

@@ -298,25 +298,6 @@ create` (GitHub-CLI-specific, used in `release.yml`) has a working
 equivalent on those platforms' Actions runners, and that the pinned
 third-party action SHAs resolve there.
 
-## [ ] Container registry publish pipeline is not implemented
-Read: AI.md PART 5 "Docker Rule" ("docker-compose.yml — image:
-ghcr.io/{org}/{name}:latest", "OCI Annotations")
-No CI provider (`.github/`, `.gitea/`, `.forgejo/`, `.gitlab-ci.yml`,
-`Jenkinsfile`) currently builds and pushes `docker/Dockerfile` to a
-registry (`ghcr.io`/equivalent) — `grep -rl 'build-push-action\|ghcr.io\|
-docker push\|docker/login-action'` across every CI config returns nothing.
-`docker/Dockerfile` is currently built only for Trivy image scanning in
-`ci.yml` (never pushed), and `docker-compose.yml`/`docker-compose.dev.yml`
-reference `ghcr.io/{org}/{name}:latest`/`:devel` images that are never
-actually produced by CI. AI.md PART 5 requires OCI annotations via
-`docker/metadata-action` + `docker/build-push-action` with
-`provenance: false` and `annotations: ${{ steps.meta.outputs.annotations }}`
-when publishing — this needs a genuine publish job (or an explicit
-IDEA.md scope-out deciding binaries-only distribution is intentional) and
-was judged out of scope for this reconciliation pass given its size
-(multi-provider registry auth, image tagging, signing) and that it
-changes release behavior rather than fixing existing broken behavior.
-
 ## [x] AI.md PART 10's own `hashFiles()` job-level `if:` example is invalid
 Read: AI.md PART 10
 Fixed upstream in the `claudemgr` `rust/APPLICATION.md` template (commit

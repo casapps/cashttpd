@@ -144,7 +144,10 @@ pipeline {
                         expression { fileExists('docker/Dockerfile') }
                     }
                     steps {
-                        sh 'docker build -f docker/Dockerfile -t cashttpd-scan:${BUILD_NUMBER} .'
+                        // docker/Dockerfile cross-compiles via
+                        // `FROM --platform=$BUILDPLATFORM`, which the legacy
+                        // (non-BuildKit) builder cannot parse.
+                        sh 'DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile -t cashttpd-scan:${BUILD_NUMBER} .'
                         script {
                             docker.image('aquasec/trivy:0.70.0').inside('--entrypoint="" -v /var/run/docker.sock:/var/run/docker.sock') {
                                 sh 'trivy image --severity CRITICAL,HIGH --exit-code 1 cashttpd-scan:${BUILD_NUMBER}'
@@ -246,6 +249,80 @@ pipeline {
                             sha512sum * > sha512.txt
                         '''
                         archiveArtifacts artifacts: 'binaries/cashttpd-bom.json,binaries/sha256.txt,binaries/sha512.txt', fingerprint: true
+                    }
+                }
+                stage('Publish Image') {
+                    steps {
+                        // Requires a Jenkins username/password credential with id
+                        // `container-registry` holding a token for the registry
+                        // derived from GIT_URL (see docker/README.md).
+                        withCredentials([usernamePassword(credentialsId: 'container-registry',
+                                                          usernameVariable: 'REGISTRY_USER',
+                                                          passwordVariable: 'REGISTRY_TOKEN')]) {
+                            // No hardcoded org, project name, or registry value
+                            // (AI.md PART 5 "Portability Rule") — org/name/host are
+                            // parsed from GIT_URL so a fork keeps working. All image
+                            // metadata is applied as OCI annotations on the manifest
+                            // index, never as LABEL blocks (AI.md PART 5 "OCI
+                            // Annotations (No LABEL Policy)").
+                            sh '''
+                                set -eu
+                                url="${GIT_URL%.git}"
+                                host="$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')"
+                                path="$(printf '%s' "$url" | sed -E 's#^[a-z]+://[^/]+/##; s#^[^:]+:##')"
+                                org="$(printf '%s' "${path%/*}" | tr '[:upper:]' '[:lower:]')"
+                                name="$(printf '%s' "${path##*/}" | tr '[:upper:]' '[:lower:]')"
+                                case "$host" in
+                                  github.com) registry="ghcr.io" ;;
+                                  *)          registry="$host" ;;
+                                esac
+                                image="$registry/$org/$name"
+
+                                if [ -s release.txt ]; then
+                                  VERSION="$(tr -d '[:space:]' < release.txt)"
+                                else
+                                  VERSION="${TAG_NAME:-0.0.0}"
+                                fi
+
+                                BUILD_EPOCH="$(date -u +%s)"
+                                BUILD_DATE="$(date -u -d "@$BUILD_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+
+                                printf '%s' "$REGISTRY_TOKEN" | docker login -u "$REGISTRY_USER" --password-stdin "$registry"
+                                docker run --rm --privileged tonistiigi/binfmt:latest --install all
+                                docker buildx create --use --name "$name-builder" 2>/dev/null || true
+
+                                set -- \
+                                  --annotation "index,manifest:maintainer=$org <$org@casjay.pro>" \
+                                  --annotation "index,manifest:org.opencontainers.image.vendor=$org" \
+                                  --annotation "index,manifest:org.opencontainers.image.authors=$org" \
+                                  --annotation "index,manifest:org.opencontainers.image.title=$name" \
+                                  --annotation "index,manifest:org.opencontainers.image.base.name=$name" \
+                                  --annotation "index,manifest:org.opencontainers.image.description=Containerized version of $name" \
+                                  --annotation "index,manifest:org.opencontainers.image.url=$url" \
+                                  --annotation "index,manifest:org.opencontainers.image.source=$url" \
+                                  --annotation "index,manifest:org.opencontainers.image.documentation=$url" \
+                                  --annotation "index,manifest:org.opencontainers.image.vcs-type=Git" \
+                                  --annotation "index,manifest:org.opencontainers.image.licenses=MIT" \
+                                  --annotation "index,manifest:org.opencontainers.image.created=$BUILD_DATE" \
+                                  --annotation "index,manifest:org.opencontainers.image.version=$VERSION" \
+                                  --annotation "index,manifest:org.opencontainers.image.schema-version=$VERSION" \
+                                  --annotation "index,manifest:org.opencontainers.image.revision=$GIT_COMMIT" \
+                                  --annotation "index,manifest:com.github.containers.toolbox=false"
+
+                                docker buildx build --push \
+                                  -f docker/Dockerfile \
+                                  --platform linux/amd64,linux/arm64 \
+                                  --provenance=false \
+                                  --build-arg "BUILD_EPOCH=$BUILD_EPOCH" \
+                                  --build-arg "COMMIT_ID=$GIT_COMMIT" \
+                                  --build-arg "PROJECT_ORG=$org" \
+                                  --build-arg "PROJECT_NAME=$name" \
+                                  "$@" \
+                                  -t "$image:latest" \
+                                  -t "$image:$VERSION" \
+                                  .
+                            '''
+                        }
                     }
                 }
             }

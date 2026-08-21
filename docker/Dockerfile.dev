@@ -5,10 +5,22 @@
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-FROM casjaysdev/rust:latest AS builder
+# Same cross-compile-in-the-builder arrangement as docker/Dockerfile: the
+# Rust compile always runs natively, only the Alpine runtime stage is
+# emulated on a foreign target platform.
+FROM --platform=$BUILDPLATFORM casjaysdev/rust:latest AS builder
+ARG TARGETARCH
 WORKDIR /work
 COPY . .
-RUN cargo build --target x86_64-unknown-linux-musl
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
+      arm64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    cargo build --target "${RUST_TARGET}"; \
+    mkdir -p /out; \
+    cp "target/${RUST_TARGET}/debug/cashttpd" /out/cashttpd
 
 FROM alpine:latest AS runtime
 ARG PROJECT_ORG
@@ -16,7 +28,7 @@ ARG PROJECT_NAME
 
 RUN apk add --no-cache tini ca-certificates
 
-COPY --from=builder /work/target/x86_64-unknown-linux-musl/debug/cashttpd /usr/local/bin/cashttpd
+COPY --from=builder /out/cashttpd /usr/local/bin/cashttpd
 COPY docker/rootfs/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/cashttpd
 

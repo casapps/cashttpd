@@ -6,18 +6,32 @@
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-FROM casjaysdev/rust:latest AS builder
+# The builder always runs on the build host's native platform and
+# cross-compiles to the requested TARGETARCH with cargo's musl targets, so a
+# multi-platform `docker buildx build --platform linux/amd64,linux/arm64`
+# never emulates the (slow) Rust compile — only the tiny Alpine runtime
+# stage is emulated.
+FROM --platform=$BUILDPLATFORM casjaysdev/rust:latest AS builder
 # Build metadata (AI.md PART 6 "Build Metadata" / PART 5 "Build-Time
 # Metadata Args"): the caller captures BUILD_EPOCH once and derives
 # BUILD_DATE from it for the OCI-annotation build step; only BUILD_EPOCH
 # and COMMIT_ID are exported here, for build.rs to embed into the binary.
 ARG BUILD_EPOCH
 ARG COMMIT_ID
+ARG TARGETARCH
 ENV BUILD_EPOCH=${BUILD_EPOCH}
 ENV COMMIT_ID=${COMMIT_ID}
 WORKDIR /work
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
+      arm64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    cargo build --release --target "${RUST_TARGET}"; \
+    mkdir -p /out; \
+    cp "target/${RUST_TARGET}/release/cashttpd" /out/cashttpd
 
 FROM alpine:latest AS runtime
 ARG PROJECT_ORG
@@ -25,7 +39,7 @@ ARG PROJECT_NAME
 
 RUN apk add --no-cache tini ca-certificates
 
-COPY --from=builder /work/target/x86_64-unknown-linux-musl/release/cashttpd /usr/local/bin/cashttpd
+COPY --from=builder /out/cashttpd /usr/local/bin/cashttpd
 COPY docker/rootfs/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/cashttpd
 

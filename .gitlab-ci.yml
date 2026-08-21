@@ -103,6 +103,10 @@ image-scan:
         - docker/Dockerfile
   services:
     - docker:dind
+  variables:
+    # docker/Dockerfile cross-compiles via `FROM --platform=$BUILDPLATFORM`,
+    # which the legacy (non-BuildKit) builder cannot parse.
+    DOCKER_BUILDKIT: "1"
   script:
     - docker build -f docker/Dockerfile -t "$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME:scan" .
     - trivy image --severity CRITICAL,HIGH --exit-code 1 "$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME:scan"
@@ -187,6 +191,93 @@ release-sbom:
   artifacts:
     paths:
       - binaries/
+
+.publish-image:
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # The Rust compile runs natively in the builder stage; binfmt/QEMU is
+    # needed only for the small Alpine runtime stage on linux/arm64.
+    - docker run --rm --privileged tonistiigi/binfmt:latest --install all
+    - docker buildx create --use --name "${CI_PROJECT_NAME}-builder"
+    # release.txt wins when present (AI.md PART 10 "Version precedence")
+    - |
+      if [ -s release.txt ]; then
+        VERSION="$(tr -d '[:space:]' < release.txt)"
+      else
+        VERSION="${CI_COMMIT_TAG:-0.0.0}"
+      fi
+      export VERSION
+    # Captured ONCE; BUILD_DATE is derived from it, never independently
+    # captured (AI.md PART 6 "Build Metadata").
+    - export BUILD_EPOCH="$(date -u +%s)"
+    - export BUILD_DATE="$(date -u -d "@$BUILD_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+    # All image metadata is applied as OCI annotations on the manifest index,
+    # never as LABEL blocks (AI.md PART 5 "OCI Annotations (No LABEL Policy)").
+    # No hardcoded org, project name, or registry value — every value comes
+    # from GitLab's own CI context (AI.md PART 5 "Portability Rule").
+    # Annotation values contain spaces, so they are carried in the shell's
+    # positional parameters ("$@") rather than a single word-split variable.
+    - |
+      set -- \
+        --annotation "index,manifest:maintainer=$CI_PROJECT_NAMESPACE <$CI_PROJECT_NAMESPACE@casjay.pro>" \
+        --annotation "index,manifest:org.opencontainers.image.vendor=$CI_PROJECT_NAMESPACE" \
+        --annotation "index,manifest:org.opencontainers.image.authors=$CI_PROJECT_NAMESPACE" \
+        --annotation "index,manifest:org.opencontainers.image.title=$CI_PROJECT_NAME" \
+        --annotation "index,manifest:org.opencontainers.image.base.name=$CI_PROJECT_NAME" \
+        --annotation "index,manifest:org.opencontainers.image.description=Containerized version of $CI_PROJECT_NAME" \
+        --annotation "index,manifest:org.opencontainers.image.url=$CI_PROJECT_URL" \
+        --annotation "index,manifest:org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --annotation "index,manifest:org.opencontainers.image.documentation=$CI_PROJECT_URL" \
+        --annotation "index,manifest:org.opencontainers.image.vcs-type=Git" \
+        --annotation "index,manifest:org.opencontainers.image.licenses=MIT" \
+        --annotation "index,manifest:org.opencontainers.image.created=$BUILD_DATE" \
+        --annotation "index,manifest:org.opencontainers.image.version=$VERSION" \
+        --annotation "index,manifest:org.opencontainers.image.schema-version=$VERSION" \
+        --annotation "index,manifest:org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --annotation "index,manifest:com.github.containers.toolbox=false"
+
+publish-image:
+  extends: .publish-image
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - |
+      docker buildx build --push \
+        -f docker/Dockerfile \
+        --platform linux/amd64,linux/arm64 \
+        --provenance=false \
+        --build-arg "BUILD_EPOCH=$BUILD_EPOCH" \
+        --build-arg "COMMIT_ID=$CI_COMMIT_SHA" \
+        --build-arg "PROJECT_ORG=$CI_PROJECT_NAMESPACE" \
+        --build-arg "PROJECT_NAME=$CI_PROJECT_NAME" \
+        "$@" \
+        -t "$CI_REGISTRY_IMAGE:latest" \
+        -t "$CI_REGISTRY_IMAGE:$VERSION" \
+        .
+
+publish-devel-image:
+  extends: .publish-image
+  stage: release
+  # `docker/docker-compose.dev.yml` runs the `:devel` tag, so the default
+  # branch publishes it. Tagged pipelines publish `:latest` / `:$VERSION`
+  # via publish-image instead.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - |
+      docker buildx build --push \
+        -f docker/Dockerfile.dev \
+        --platform linux/amd64,linux/arm64 \
+        --provenance=false \
+        --build-arg "PROJECT_ORG=$CI_PROJECT_NAMESPACE" \
+        --build-arg "PROJECT_NAME=$CI_PROJECT_NAME" \
+        "$@" \
+        -t "$CI_REGISTRY_IMAGE:devel" \
+        .
 
 release-publish:
   stage: release
