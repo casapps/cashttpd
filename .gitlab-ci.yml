@@ -104,8 +104,6 @@ image-scan:
   services:
     - docker:dind
   variables:
-    # docker/Dockerfile cross-compiles via `FROM --platform=$BUILDPLATFORM`,
-    # which the legacy (non-BuildKit) builder cannot parse.
     DOCKER_BUILDKIT: "1"
   script:
     - docker build -f docker/Dockerfile -t "$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME:scan" .
@@ -198,8 +196,9 @@ release-sbom:
     - docker:dind
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    # The Rust compile runs natively in the builder stage; binfmt/QEMU is
-    # needed only for the small Alpine runtime stage on linux/arm64.
+    # The whole builder stage is QEMU-emulated for a foreign target platform
+    # (casjaysdev/rust:latest has no cross-compile linker installed), same
+    # as the Alpine runtime stage.
     - docker run --rm --privileged tonistiigi/binfmt:latest --install all
     - docker buildx create --use --name "${CI_PROJECT_NAME}-builder"
     # release.txt wins when present (AI.md PART 10 "Version precedence")

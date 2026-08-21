@@ -19,8 +19,7 @@ steps.
 
 ## Build the runtime image
 
-Run from the repository root. BuildKit is required — the builder stage is
-`FROM --platform=$BUILDPLATFORM`, which the legacy builder cannot parse.
+Run from the repository root.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
@@ -66,9 +65,10 @@ the same pipeline:
   `:devel`
 
 Both are multi-arch (`linux/amd64,linux/arm64`) manifest lists built with
-`docker buildx`. The Rust compile always runs natively on the build host and
-cross-compiles to the target's musl triple; only the small Alpine runtime
-stage is QEMU-emulated.
+`docker buildx`. The whole builder stage is QEMU-emulated for a foreign
+target platform — `casjaysdev/rust:latest` has no cross-compile linker
+installed, so the Rust compile itself runs emulated too, same as the small
+Alpine runtime stage.
 
 The registry and image name are never hardcoded — they are derived from the
 provider context, so a fork publishes to the fork's own registry:

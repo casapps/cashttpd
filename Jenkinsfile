@@ -144,9 +144,6 @@ pipeline {
                         expression { fileExists('docker/Dockerfile') }
                     }
                     steps {
-                        // docker/Dockerfile cross-compiles via
-                        // `FROM --platform=$BUILDPLATFORM`, which the legacy
-                        // (non-BuildKit) builder cannot parse.
                         sh 'DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile -t cashttpd-scan:${BUILD_NUMBER} .'
                         script {
                             docker.image('aquasec/trivy:0.70.0').inside('--entrypoint="" -v /var/run/docker.sock:/var/run/docker.sock') {

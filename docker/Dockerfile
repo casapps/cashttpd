@@ -6,28 +6,30 @@
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-# The builder always runs on the build host's native platform and
-# cross-compiles to the requested TARGETARCH with cargo's musl targets, so a
-# multi-platform `docker buildx build --platform linux/amd64,linux/arm64`
-# never emulates the (slow) Rust compile — only the tiny Alpine runtime
-# stage is emulated.
-FROM --platform=$BUILDPLATFORM casjaysdev/rust:latest AS builder
+# The builder runs under the target platform itself (QEMU-emulated for a
+# foreign arch, same as the runtime stage) rather than cross-compiling: the
+# casjaysdev/rust:latest image has no aarch64-linux-musl-cross linker
+# installed, so `FROM --platform=$BUILDPLATFORM` + `--target
+# aarch64-unknown-linux-musl` fails building `ring`'s C dependencies. Native
+# per-platform build with `cargo build` (no explicit --target — musl is
+# already the image's default target) keeps this correct even though it is
+# slower than a genuine cross-compile.
+FROM casjaysdev/rust:latest AS builder
 # Build metadata (AI.md PART 6 "Build Metadata" / PART 5 "Build-Time
 # Metadata Args"): the caller captures BUILD_EPOCH once and derives
 # BUILD_DATE from it for the OCI-annotation build step; only BUILD_EPOCH
 # and COMMIT_ID are exported here, for build.rs to embed into the binary.
 ARG BUILD_EPOCH
 ARG COMMIT_ID
-ARG TARGETARCH
 ENV BUILD_EPOCH=${BUILD_EPOCH}
 ENV COMMIT_ID=${COMMIT_ID}
 WORKDIR /work
 COPY . .
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-      amd64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-      arm64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    case "$(uname -m)" in \
+      x86_64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
+      aarch64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     cargo build --release --target "${RUST_TARGET}"; \
     mkdir -p /out; \

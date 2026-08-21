@@ -5,18 +5,19 @@
 ARG PROJECT_ORG
 ARG PROJECT_NAME
 
-# Same cross-compile-in-the-builder arrangement as docker/Dockerfile: the
-# Rust compile always runs natively, only the Alpine runtime stage is
-# emulated on a foreign target platform.
-FROM --platform=$BUILDPLATFORM casjaysdev/rust:latest AS builder
-ARG TARGETARCH
+# Same arrangement as docker/Dockerfile: the builder runs under the target
+# platform itself (QEMU-emulated for a foreign arch) rather than
+# cross-compiling — casjaysdev/rust:latest has no aarch64-linux-musl-cross
+# linker installed, so a `--platform=$BUILDPLATFORM` cross-build fails
+# building `ring`'s C dependencies.
+FROM casjaysdev/rust:latest AS builder
 WORKDIR /work
 COPY . .
 RUN set -eu; \
-    case "${TARGETARCH}" in \
-      amd64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-      arm64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    case "$(uname -m)" in \
+      x86_64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
+      aarch64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     cargo build --target "${RUST_TARGET}"; \
     mkdir -p /out; \
