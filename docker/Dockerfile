@@ -39,7 +39,12 @@ COPY . .
 # here (confirmed empirically: `cargo build -v` with a RUSTFLAGS marker
 # never shows it on any --crate-type proc-macro invocation). The only path
 # rust-lld actually searches unconditionally is the target's rustlib
-# sysroot dir, so symlink the two libraries there instead.
+# sysroot dir, so symlink the libraries there instead. The libgcc_s.so
+# symlink alone was not enough (confirmed via a real CI run): it is a
+# GNU ld linker script ("GROUP ( libgcc_s.so.1 -lgcc )"), not a real ELF
+# file, so its indirect targets (libgcc_s.so.1, libgcc.a) must also be
+# reachable from the same searched directory, hence the extra symlinks
+# below.
 RUN apk add --no-cache gcc musl-dev
 RUN set -eu; \
     case "$(uname -m)" in \
@@ -50,7 +55,10 @@ RUN set -eu; \
     if [ "${RUST_TARGET}" = "aarch64-unknown-linux-musl" ]; then \
       SYSROOT_LIB="$(rustc --print sysroot)/lib/rustlib/${RUST_TARGET}/lib"; \
       ln -sf /usr/lib/libgcc_s.so "${SYSROOT_LIB}/libgcc_s.so"; \
+      ln -sf /usr/lib/libgcc_s.so.1 "${SYSROOT_LIB}/libgcc_s.so.1"; \
       ln -sf /usr/lib/libc.so "${SYSROOT_LIB}/libc.so"; \
+      LIBGCC_A="$(find /usr/lib/gcc -name libgcc.a | head -1)"; \
+      [ -n "${LIBGCC_A}" ] && ln -sf "${LIBGCC_A}" "${SYSROOT_LIB}/libgcc.a"; \
     fi; \
     cargo build --release --target "${RUST_TARGET}"; \
     mkdir -p /out; \
