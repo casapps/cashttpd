@@ -1,24 +1,23 @@
 # syntax=docker/dockerfile:1
 # Extended Rust toolchain image — used only by CI steps that need
-# `cargo-about` and `cargo-cyclonedx` for attribution/SBOM generation
-# (AI.md PART 10 "Suggested CI Steps", PART 11 "Required Tooling").
+# `cargo-about` for attribution generation (AI.md PART 10 "Suggested CI
+# Steps", PART 11 "Required Tooling").
 #
 # casjaysdev/rust:latest is the mandatory base for every other CI step
 # (AI.md PART 5 "Toolchain Image") and this file exists only because that
-# externally maintained image did not originally ship `cargo-about` or
-# `cargo-cyclonedx` — the documented "genuine custom need" carve-out for
-# `docker/Dockerfile.build` (AI.md PART 12 checklist / global build rules).
+# externally maintained image does not ship `cargo-about` — the
+# documented "genuine custom need" carve-out for `docker/Dockerfile.build`
+# (AI.md PART 12 checklist / global build rules). `cargo-cyclonedx` is
+# deliberately NOT installed here: casjaysdev/rust:latest already ships
+# its own `/usr/local/bin/cargo-cyclonedx` (confirmed directly —
+# `cargo cyclonedx --version` reports `cargo-cyclonedx-cyclonedx 0.5.9`
+# on a freshly pulled image, with no install step run), so installing it
+# again here would be redundant (and previously failed outright with
+# "binary already exists in destination" before this was understood).
 # Extend, never replace: this always builds FROM casjaysdev/rust:latest.
 
 FROM casjaysdev/rust:latest
 
 # cargo-about's binary target is gated behind the `cli` feature; without it
-# the crate compiles but installs no executable. `--force` on
-# cargo-cyclonedx: casjaysdev/rust:latest has since started shipping its
-# own cargo-cyclonedx binary (confirmed via a real CI run: "error: binary
-# `cargo-cyclonedx` already exists in destination"), so a plain
-# `cargo install` now fails outright instead of being a no-op; `--force`
-# keeps this working regardless of whether the base image provides it,
-# reinstalling the pinned `--locked` version either way.
-RUN cargo install --locked cargo-about --features cli \
- && cargo install --locked --force cargo-cyclonedx
+# the crate compiles but installs no executable.
+RUN cargo install --locked cargo-about --features cli
