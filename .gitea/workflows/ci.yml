@@ -35,6 +35,17 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: casjaysdev/rust:latest
+    # `.cargo/config.toml` attaches `-C target-feature=+crt-static` to the
+    # musl targets; a bare `cargo` invocation with no explicit target applies
+    # those rustflags to host build artifacts too here (the container's host
+    # triple already is x86_64-unknown-linux-musl), which makes proc-macro
+    # crates (a dynamic library by definition) impossible to produce —
+    # "cannot produce proc-macro ... as the target does not support these
+    # crate types". Naming the target explicitly keeps target rustflags off
+    # host units, matching the Makefile's `CARGO_BUILD_TARGET` for local
+    # Docker builds (see Makefile's own comment for the full explanation).
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - run: cargo fmt --all --check
@@ -44,6 +55,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: casjaysdev/rust:latest
+    # See the `lint` job's comment above for why this is needed.
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - run: cargo test --workspace --all-features
@@ -52,6 +66,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: casjaysdev/rust:latest
+    # See the `lint` job's comment above for why this is needed.
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       # IDEA.md does not declare a coverage threshold, so the PART 8 default
@@ -69,6 +86,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: casjaysdev/rust:latest
+    # See the `lint` job's comment above for why this is needed.
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - run: cargo doc --workspace --no-deps

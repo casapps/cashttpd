@@ -80,16 +80,7 @@ pub fn spawn(
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(MAX_BIDI_STREAMS.into());
     transport.max_concurrent_uni_streams(MAX_UNI_STREAMS.into());
-    transport.max_idle_timeout(Some(
-        quinn::VarInt::from_u32(MAX_IDLE_MS)
-            .try_into()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalid QUIC idle timeout",
-                )
-            })?,
-    ));
+    transport.max_idle_timeout(Some(quinn::VarInt::from_u32(MAX_IDLE_MS).into()));
     server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
@@ -181,23 +172,18 @@ async fn serve_stream(
     // makes the limit real on a protocol where the length header is advisory.
     let mut body = Vec::new();
     let mut oversized = false;
-    loop {
-        match stream.recv_data().await.map_err(std::io::Error::other)? {
-            Some(chunk) => {
-                if oversized {
-                    continue;
-                }
-                let mut chunk = chunk;
-                let remaining = chunk.remaining();
-                if body.len() as u64 + remaining as u64 > MAX_REQUEST_BODY {
-                    oversized = true;
-                    body.clear();
-                    continue;
-                }
-                body.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
-            }
-            None => break,
+    while let Some(chunk) = stream.recv_data().await.map_err(std::io::Error::other)? {
+        if oversized {
+            continue;
         }
+        let mut chunk = chunk;
+        let remaining = chunk.remaining();
+        if body.len() as u64 + remaining as u64 > MAX_REQUEST_BODY {
+            oversized = true;
+            body.clear();
+            continue;
+        }
+        body.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
     }
 
     let response = if oversized {
