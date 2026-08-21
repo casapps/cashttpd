@@ -11,9 +11,8 @@ ARG PROJECT_NAME
 # casjaysdev/rust:latest image has no aarch64-linux-musl-cross linker
 # installed, so `FROM --platform=$BUILDPLATFORM` + `--target
 # aarch64-unknown-linux-musl` fails building `ring`'s C dependencies. Native
-# per-platform build with `cargo build` (no explicit --target — musl is
-# already the image's default target) keeps this correct even though it is
-# slower than a genuine cross-compile.
+# per-platform build with an explicit `--target` (below) keeps this correct
+# even though it is slower than a genuine cross-compile.
 FROM casjaysdev/rust:latest AS builder
 # Build metadata (AI.md PART 6 "Build Metadata" / PART 5 "Build-Time
 # Metadata Args"): the caller captures BUILD_EPOCH once and derives
@@ -25,6 +24,16 @@ ENV BUILD_EPOCH=${BUILD_EPOCH}
 ENV COMMIT_ID=${COMMIT_ID}
 WORKDIR /work
 COPY . .
+# aarch64-unknown-linux-musl's self-contained rustup sysroot is less complete
+# than x86_64-unknown-linux-musl's: linking the proc-macro crates this
+# project depends on (tokio-macros, futures-macro, thiserror-impl — always
+# built for the host, dynamically, even under `-C target-feature=+crt-static`
+# for the target) fails with "rust-lld: error: unable to find library
+# -lgcc_s" / "-lc" on aarch64 because casjaysdev/rust:latest ships neither
+# package (confirmed via a real CI run: the identical x86_64 build succeeds
+# without them). `gcc`+`musl-dev` supply those two static libraries from
+# Alpine's own packages, which is enough for rust-lld to resolve them.
+RUN apk add --no-cache gcc musl-dev
 RUN set -eu; \
     case "$(uname -m)" in \
       x86_64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
