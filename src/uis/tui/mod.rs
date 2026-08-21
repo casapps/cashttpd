@@ -4,7 +4,7 @@
 /// Entry point for TUI mode. Full ratatui-based UI is tracked in
 /// TODO.AI.md.
 pub fn run() {
-    println!("cashttpd {} (tui mode)", crate::support::version::VERSION);
+    println!("cashttpd {} (tui mode)", crate::supports::version::VERSION);
 }
 
 #[cfg(test)]

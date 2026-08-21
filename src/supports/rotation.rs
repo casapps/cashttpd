@@ -90,7 +90,7 @@ pub fn parse_keep(spec: &str) -> KeepPolicy {
 }
 
 /// Proleptic-Gregorian civil date (year, month 1-12, day 1-31) for a Unix
-/// timestamp — shared by rotation-period math and `server::format_http_date`.
+/// timestamp — shared by rotation-period math and `servers::format_http_date`.
 pub fn civil_date_from_unix(unix_secs: u64) -> (i64, u32, u32) {
     let mut days = (unix_secs / 86400) as i64;
     let mut year = 1970i64;

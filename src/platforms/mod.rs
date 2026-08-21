@@ -157,7 +157,7 @@ pub mod paths {
     /// Per-user data directory — see `config_dir()` for the per-OS pattern
     /// this mirrors. Used for TLS certificate storage
     /// (`{data_dir}/certs/{derived_name}/` per IDEA.md "TLS certificate
-    /// resolution") — see `server::tls::cert_dir()`.
+    /// resolution") — see `servers::tls::cert_dir()`.
     pub fn data_dir() -> PathBuf {
         #[cfg(target_os = "macos")]
         {

@@ -29,7 +29,7 @@ pub const BUILD_EPOCH: &str = match option_env!("APP_BUILD_EPOCH") {
 ///
 /// Formatted by hand from `time::OffsetDateTime` field accessors rather than
 /// via the crate's `formatting` feature — `time` is already a dependency
-/// (`server::tls` certificate validity) and this avoids pulling in an extra
+/// (`servers::tls` certificate validity) and this avoids pulling in an extra
 /// feature/dependency surface for a single fixed-format timestamp.
 pub fn build_date() -> String {
     match BUILD_EPOCH.parse::<i64>() {

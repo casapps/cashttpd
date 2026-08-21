@@ -1,7 +1,7 @@
 //! Framework dev-server proxying (IDEA.md "Framework dev-server proxying").
 //!
 //! `resolve_proxy_target` layers the resolved `proxy.*` config
-//! (`crate::config::ProxyLayer`) over a built-in table of framework
+//! (`crate::configs::ProxyLayer`) over a built-in table of framework
 //! profiles auto-detected from marker files in `base_dir` — any of
 //! `enabled`/`command`/`upstream`/`path_prefix` explicitly set in config
 //! overrides the corresponding auto-detected value independently; setting
@@ -12,7 +12,7 @@
 //!
 //! `spawn_child` starts the framework's dev-server process once at `run()`
 //! startup (never per-request); its PID is handed to
-//! `crate::support::signal::ShutdownState::track_child_process` so it is
+//! `crate::supports::signal::ShutdownState::track_child_process` so it is
 //! killed on every signal-driven exit path, including the "second signal
 //! forces an immediate exit" escape hatch.
 //!
@@ -192,7 +192,7 @@ pub struct ProxyTarget {
 /// with no `type` and no detected profile, is itself sufficient.
 pub fn resolve_proxy_target(
     base_dir: &Path,
-    layer: &crate::config::ProxyLayer,
+    layer: &crate::configs::ProxyLayer,
 ) -> Option<ProxyTarget> {
     if layer.enabled == Some(false) {
         return None;
@@ -298,6 +298,13 @@ fn starting_page(request: &Request) -> String {
 /// Forwards `request`/`body` to `target.upstream` and relays the response
 /// back to `stream`, streamed rather than buffered. See the module doc
 /// comment for the exact request/response fidelity rules.
+// Each parameter is an independent piece of per-request proxy state
+// (connection, matched target, parsed request, already-read body, client
+// address, effective server config, keep-alive decision) that the caller
+// already has on hand from the request-dispatch loop — bundling them into a
+// struct would only add an indirection layer without reducing the actual
+// information this function needs to relay the request upstream and stream
+// the response back.
 #[allow(clippy::too_many_arguments)]
 pub fn proxy_request(
     stream: &mut Conn,
@@ -404,6 +411,10 @@ fn bad_gateway(
     )
 }
 
+// Mirrors `proxy_request`'s parameter shape one call down: the upstream
+// socket plus the same already-parsed request/body/client/config values are
+// each used independently while rewriting and forwarding the request line
+// and headers — grouping them would not shrink the real per-call state.
 #[allow(clippy::too_many_arguments)]
 fn write_upstream_request(
     upstream: &mut TcpStream,
@@ -678,7 +689,7 @@ mod tests {
     }
 
     fn test_opts(base_dir: std::path::PathBuf) -> ServeOptions {
-        crate::config::Resolved {
+        crate::configs::Resolved {
             base_dir,
             listen: "127.0.0.1".to_string(),
             port: 0,
@@ -776,7 +787,7 @@ mod tests {
     fn resolve_returns_none_when_explicitly_disabled_despite_markers() {
         let dir = make_dir("disabled");
         std::fs::write(dir.join("manage.py"), "").unwrap();
-        let layer = crate::config::ProxyLayer {
+        let layer = crate::configs::ProxyLayer {
             enabled: Some(false),
             ..Default::default()
         };
@@ -786,14 +797,14 @@ mod tests {
     #[test]
     fn resolve_returns_none_with_no_markers_and_no_overrides() {
         let dir = make_dir("nomarkers");
-        let layer = crate::config::ProxyLayer::default();
+        let layer = crate::configs::ProxyLayer::default();
         assert!(resolve_proxy_target(&dir, &layer).is_none());
     }
 
     #[test]
     fn resolve_reuses_profile_defaults_from_explicit_type() {
         let dir = make_dir("type-only");
-        let layer = crate::config::ProxyLayer {
+        let layer = crate::configs::ProxyLayer {
             kind: Some("django".to_string()),
             ..Default::default()
         };
@@ -807,7 +818,7 @@ mod tests {
     #[test]
     fn resolve_command_override_keeps_profile_upstream() {
         let dir = make_dir("command-override");
-        let layer = crate::config::ProxyLayer {
+        let layer = crate::configs::ProxyLayer {
             kind: Some("node".to_string()),
             command: Some("yarn dev".to_string()),
             ..Default::default()
@@ -820,7 +831,7 @@ mod tests {
     #[test]
     fn resolve_fully_explicit_command_and_upstream_needs_no_type() {
         let dir = make_dir("fully-explicit");
-        let layer = crate::config::ProxyLayer {
+        let layer = crate::configs::ProxyLayer {
             command: Some("./run-dev-server.sh".to_string()),
             upstream: Some("127.0.0.1:4000".to_string()),
             path_prefix: Some("/app".to_string()),

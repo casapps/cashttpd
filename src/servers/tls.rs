@@ -28,7 +28,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Either half of a connection this server terminates — a plain TCP socket,
 /// or one wrapped in a TLS server session. Read/Write are delegated so the
-/// rest of `server::mod` (request parsing, response writing, CGI plumbing)
+/// rest of `servers::mod` (request parsing, response writing, CGI plumbing)
 /// stays oblivious to whether TLS is in play.
 pub enum Conn {
     Plain(TcpStream),
@@ -71,9 +71,9 @@ impl Write for Conn {
 /// `{data_dir}/certs/{derived_name}/` — where self-generated/obtained certs
 /// live (IDEA.md "TLS certificate resolution"). Never `base_dir`.
 pub fn cert_dir(base_dir: &Path) -> PathBuf {
-    crate::platform::paths::data_dir()
+    crate::platforms::paths::data_dir()
         .join("certs")
-        .join(crate::config::derived_name(base_dir))
+        .join(crate::configs::derived_name(base_dir))
 }
 
 /// Builds the `rustls::ServerConfig` to terminate HTTPS with, running the
@@ -346,7 +346,7 @@ fn parse_asn1_time(tag: u8, content: &[u8]) -> Option<i64> {
 
 /// Howard Hinnant's `days_from_civil` — proleptic-Gregorian civil date to a
 /// day count relative to the Unix epoch. The inverse of
-/// `support::rotation::civil_date_from_unix`.
+/// `supports::rotation::civil_date_from_unix`.
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -372,7 +372,7 @@ fn cert_is_currently_valid(cert_der: &[u8]) -> bool {
 // ACME v2 (RFC 8555) HTTP-01 client. Hand-rolled HTTPS request/response
 // framing (see module doc comment for why `ureq` isn't used); JWS signing
 // via `ring` (ECDSA P-256); JSON via `serde_json`; CSR generation via
-// `rcgen`. Modeled on `server::parse_request`'s own hand-rolled HTTP/1.1
+// `rcgen`. Modeled on `servers::parse_request`'s own hand-rolled HTTP/1.1
 // framing.
 // ---------------------------------------------------------------------------
 mod acme {
@@ -769,7 +769,7 @@ mod acme {
     }
 
     /// A single hand-rolled HTTPS request over `rustls::ClientConnection` +
-    /// `TcpStream` (mirrors `server::parse_request`'s own HTTP/1.1 framing).
+    /// `TcpStream` (mirrors `servers::parse_request`'s own HTTP/1.1 framing).
     /// Always opens a fresh connection and sends `Connection: close`.
     fn https_request(
         url: &str,
@@ -948,7 +948,8 @@ mod tests {
 
     #[test]
     fn cert_dir_is_scoped_under_data_dir_certs() {
-        let dir = cert_dir(Path::new("/tmp/some-project"));
+        let base = std::env::temp_dir().join("some-project");
+        let dir = cert_dir(&base);
         assert!(dir.to_string_lossy().contains("certs"));
     }
 }

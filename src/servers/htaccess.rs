@@ -8,7 +8,7 @@
 //! `RewriteEngine`/`RewriteCond`/`RewriteRule`/`Redirect`/`RedirectMatch`.
 //!
 //! `.htaccess`/`.htpasswd` themselves are never servable as static content
-//! at any depth (trust boundary enforced in `server::handle_request`, not
+//! at any depth (trust boundary enforced in `servers::handle_request`, not
 //! here, and this module cannot be made to override it from within a
 //! `.htaccess` file — there is no directive that touches it).
 

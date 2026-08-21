@@ -57,7 +57,7 @@ impl ShutdownState {
 
     /// Builds a fresh, never-shutdown-requested state without registering
     /// any real OS signal handler — for tests that need a `ShutdownState`
-    /// to pass into code under test (e.g. `server::apply_reload`) but must
+    /// to pass into code under test (e.g. `servers::apply_reload`) but must
     /// not risk a real `SIGINT`/`SIGTERM`/`SIGHUP` handler registration
     /// firing across unrelated tests sharing the same test binary process.
     #[cfg(test)]

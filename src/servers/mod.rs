@@ -11,19 +11,19 @@
 //! Also implements CGI 1.1 / multi-language script execution (`cgi-bin/`
 //! exec-by-shebang and extension-based `script_handlers` interpreter
 //! dispatch), scheduled log rotation/retention, and `.htaccess`/`.htpasswd`
-//! Apache-compatible per-directory configuration (`server::htaccess`) —
+//! Apache-compatible per-directory configuration (`servers::htaccess`) —
 //! recursive discovery/cascade merge, `AuthType Basic` + bcrypt/apr1/
 //! `{SHA}` `.htpasswd` authentication, `Require`/legacy `Order`/`Allow`/
 //! `Deny` authorization, `ErrorDocument`, `DirectoryIndex`, `Options
 //! Indexes`/`FollowSymLinks`, and `RewriteEngine`/`RewriteRule`/`Redirect`/
 //! `RedirectMatch`, applied per the documented 6-phase per-request order.
 //!
-//! Also implements framework dev-server proxying (`server::proxy`, IDEA.md
+//! Also implements framework dev-server proxying (`servers::proxy`, IDEA.md
 //! "Framework dev-server proxying"): auto-detected or explicitly configured
 //! requests under a `path_prefix` are relayed to a spawned dev-server child
 //! process, streamed both ways, with WebSocket/`Upgrade` support.
 //!
-//! Also implements the `/server-info` diagnostics dashboard (`server::info`,
+//! Also implements the `/server-info` diagnostics dashboard (`servers::info`,
 //! IDEA.md "`/server-info` diagnostics dashboard"): a built-in, always-on
 //! route (dispatched before the framework-proxy prefix check and before the
 //! `.htaccess` 6-phase pipeline) rendering live request/response stats,
@@ -33,9 +33,9 @@
 //!
 //! Also implements live config-file reload (IDEA.md "Configuration file" →
 //! "Live reload"): `run`'s accept loop polls the mtimes of the same global/
-//! per-project files `crate::config::load` reads (via
-//! `crate::config::config_paths`) roughly once a second, and on a detected
-//! change re-runs `crate::config::load` with the original startup
+//! per-project files `crate::configs::load` reads (via
+//! `crate::configs::config_paths`) roughly once a second, and on a detected
+//! change re-runs `crate::configs::load` with the original startup
 //! `CliOverrides` (so CLI-flag precedence still wins) and diffs the result
 //! against the running configuration to decide what to apply: hot-appliable
 //! settings (`directory_listing`, `mime_types`, `script_handlers`, `debug`,
@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::support::signal;
+use crate::supports::signal;
 
 mod htaccess;
 mod info;
@@ -82,32 +82,32 @@ use tls::Conn;
 
 /// Effective runtime configuration for `serve` — the fully layered result
 /// of IDEA.md's "CLI flag > env var > per-project config > global config >
-/// built-in default" precedence (see `crate::config::load`).
-pub type ServeOptions = crate::config::Resolved;
+/// built-in default" precedence (see `crate::configs::load`).
+pub type ServeOptions = crate::configs::Resolved;
 
 /// Parses the `serve` subcommand's CLI flags and layers them over
-/// environment variables and config-file settings via `crate::config::load`
+/// environment variables and config-file settings via `crate::configs::load`
 /// (IDEA.md "Configuration file", "CLI flags (full reference)"). Also
 /// returns the parsed `CliOverrides` themselves — `run` needs them again at
 /// live-reload time so a reload re-runs the exact same CLI-flag > env >
 /// per-project > global > default precedence chain, rather than letting a
 /// file edit override a flag the user passed at startup.
-pub fn parse_serve_options(args: &[String]) -> (ServeOptions, crate::config::CliOverrides) {
+pub fn parse_serve_options(args: &[String]) -> (ServeOptions, crate::configs::CliOverrides) {
     let overrides = parse_cli_overrides(args);
-    let opts = crate::config::load(&overrides, true).unwrap_or_else(|err| {
+    let opts = crate::configs::load(&overrides, true).unwrap_or_else(|err| {
         eprintln!("cashttpd: warning: config load failed ({err}); using built-in defaults");
-        crate::config::load(&crate::config::CliOverrides::default(), false)
+        crate::configs::load(&crate::configs::CliOverrides::default(), false)
             .unwrap_or_else(|_| fallback_defaults())
     });
     (opts, overrides)
 }
 
 fn fallback_defaults() -> ServeOptions {
-    crate::config::Resolved {
+    crate::configs::Resolved {
         base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         listen: "::1".to_string(),
         port: 8080,
-        log_dir: crate::platform::paths::log_dir(),
+        log_dir: crate::platforms::paths::log_dir(),
         debug: false,
         fqdn: None,
         tls_enabled: false,
@@ -128,9 +128,9 @@ fn fallback_defaults() -> ServeOptions {
 /// Parses `--listen`, `--port`, `--dir`, `--fqdn`, `--log`, `--config`,
 /// `--debug` into a `CliOverrides` (IDEA.md "CLI flags (full reference)").
 /// `--daemon`/`--quiet`/`--config-test` are invocation-shape flags handled
-/// by `crate::ui::cli`, not persisted settings — they are not parsed here.
-pub fn parse_cli_overrides(args: &[String]) -> crate::config::CliOverrides {
-    let mut o = crate::config::CliOverrides::default();
+/// by `crate::uis::cli`, not persisted settings — they are not parsed here.
+pub fn parse_cli_overrides(args: &[String]) -> crate::configs::CliOverrides {
+    let mut o = crate::configs::CliOverrides::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -194,7 +194,7 @@ pub fn parse_cli_overrides(args: &[String]) -> crate::config::CliOverrides {
 pub fn run(
     opts: ServeOptions,
     quiet: bool,
-    cli: crate::config::CliOverrides,
+    cli: crate::configs::CliOverrides,
 ) -> std::io::Result<()> {
     // IDEA.md "TLS certificate resolution": `--fqdn` is required whenever
     // `tls.enabled: true` — fail fast, non-zero exit, no certless/
@@ -225,7 +225,7 @@ pub fn run(
     // daemon never continues running as root after binding. A live-reload
     // rebind onto a privileged port after this point will fail (expected —
     // see `apply_reload`), and is logged as a warning rather than crashing.
-    crate::platform::drop_privileges_if_root()?;
+    crate::platforms::drop_privileges_if_root()?;
 
     let shutdown = signal::install_handlers()?;
 
@@ -235,7 +235,7 @@ pub fn run(
             .unwrap_or_else(|_| opts.base_dir.clone()),
     );
     std::fs::create_dir_all(&opts.log_dir).ok();
-    let name = crate::config::derived_name(&base_dir);
+    let name = crate::configs::derived_name(&base_dir);
     let logger = Arc::new(Logger::open_with_policy(
         &opts.log_dir,
         &name,
@@ -248,28 +248,28 @@ pub fn run(
 
     let banner = format!(
         "cashttpd {} listening on {} (base dir: {}, {})",
-        crate::support::version::VERSION,
+        crate::supports::version::VERSION,
         format_bind_addr(&opts),
         base_dir.display(),
         if opts.tls_enabled { "https" } else { "http" }
     );
-    if crate::support::color::color_enabled(None) {
+    if crate::supports::color::color_enabled(None) {
         let light_bg = std::env::var("COLORFGBG")
             .ok()
             .and_then(|v| v.rsplit(';').next().map(str::to_string))
             .and_then(|bg| bg.parse::<u8>().ok())
             .is_some_and(|bg| bg >= 8);
         let palette = if light_bg {
-            crate::support::color::terminal_palette_light()
+            crate::supports::color::terminal_palette_light()
         } else {
-            crate::support::color::terminal_palette_dark()
+            crate::supports::color::terminal_palette_dark()
         };
         println!("\x1b[38;5;{}m{banner}\x1b[0m", palette.primary);
     } else {
         println!("{banner}");
     }
 
-    let stats = Arc::new(info::Stats::new(crate::platform::sandboxing_posture()));
+    let stats = Arc::new(info::Stats::new(crate::platforms::sandboxing_posture()));
     // Startup-time TLS warnings aren't tied to a specific request — recorded
     // with synthetic method/target/status values consistent with that.
     for warning in &tls_warnings {
@@ -309,11 +309,11 @@ pub fn run(
     }
 
     // Live config-file reload (IDEA.md "Configuration file" → "Live
-    // reload"): watch the same two files `crate::config::load` reads, and
+    // reload"): watch the same two files `crate::configs::load` reads, and
     // bundle everything a reload can swap atomically into one cell so a
     // connection accepted mid-reload always sees an internally-consistent
     // snapshot (never, say, a new `opts` paired with the old `logger`).
-    let (global_config_path, project_config_path) = crate::config::config_paths(&cli);
+    let (global_config_path, project_config_path) = crate::configs::config_paths(&cli);
     let mut reload_watch = ReloadWatch::new(global_config_path, project_config_path);
     let mut last_reload_check = Instant::now();
     let runtime: Mutex<Arc<RuntimeState>> = Mutex::new(Arc::new(RuntimeState {
@@ -402,8 +402,8 @@ pub fn run(
 
     println!(
         "cashttpd: graceful shutdown complete after {}, served {} requests",
-        crate::support::format::duration(started_at.elapsed().as_secs()),
-        crate::support::format::count(stats.total_requests())
+        crate::supports::format::duration(started_at.elapsed().as_secs()),
+        crate::supports::format::count(stats.total_requests())
     );
 
     Ok(())
@@ -543,7 +543,7 @@ fn config_needs_logger_reopen(old: &ServeOptions, new: &ServeOptions) -> bool {
         || old.logging_error_keep != new.logging_error_keep
 }
 
-/// One reload attempt: re-runs `crate::config::load` with the original
+/// One reload attempt: re-runs `crate::configs::load` with the original
 /// startup `cli` overrides (so CLI-flag precedence still wins over any
 /// file change) and, when the result actually differs, applies whatever of
 /// it can be applied live — a listener rebind, a framework dev-server
@@ -554,9 +554,16 @@ fn config_needs_logger_reopen(old: &ServeOptions, new: &ServeOptions) -> bool {
 /// port after privileges were already dropped) is logged as a warning and
 /// recorded on the `/server-info` dashboard; the server keeps running on
 /// its previous configuration for that piece rather than crashing.
+// Each parameter is a distinct piece of the running server's live state
+// (client overrides for precedence, the swappable runtime cell, the bound
+// listener that may need rebinding, base_dir, quiet flag, the proxy child
+// process, shutdown/signal state, and stats) that live-reload (IDEA.md
+// "Configuration file" → "Live reload") must inspect or mutate together in
+// one atomic pass; splitting them into a struct would just relocate the
+// same fields without reducing what this function actually touches.
 #[allow(clippy::too_many_arguments)]
 fn apply_reload(
-    cli: &crate::config::CliOverrides,
+    cli: &crate::configs::CliOverrides,
     runtime: &Mutex<Arc<RuntimeState>>,
     listener: &mut TcpListener,
     base_dir: &Path,
@@ -567,7 +574,7 @@ fn apply_reload(
 ) {
     let current = Arc::clone(&runtime.lock().unwrap());
 
-    let mut new_opts = match crate::config::load(cli, false) {
+    let mut new_opts = match crate::configs::load(cli, false) {
         Ok(o) => o,
         Err(err) => {
             let msg = format!("config reload failed: {err}; keeping previous configuration");
@@ -669,7 +676,7 @@ fn apply_reload(
 
     let logger = if config_needs_logger_reopen(&current.opts, &new_opts) {
         std::fs::create_dir_all(&new_opts.log_dir).ok();
-        let name = crate::config::derived_name(base_dir);
+        let name = crate::configs::derived_name(base_dir);
         Arc::new(Logger::open_with_policy(
             &new_opts.log_dir,
             &name,
@@ -813,6 +820,10 @@ fn read_chunked_body(reader: &mut BufReader<Conn>) -> std::io::Result<Option<Vec
 
 /// Serves every keep-alive request on one connection (RFC 9112 §9.3 —
 /// HTTP/1.1 connections are persistent unless `Connection: close` is sent).
+// The connection, base_dir, effective config, logger, client address,
+// stats, and optional proxy target are each read independently while
+// dispatching every request on this connection — this is the per-connection
+// context threaded through the accept loop, not incidental grouping.
 #[allow(clippy::too_many_arguments)]
 fn serve_connection(
     conn: Conn,
@@ -1079,6 +1090,11 @@ fn resolve_script_path_info(
     None
 }
 
+// This is the top-level per-request dispatcher (static files, CGI/scripts,
+// proxying, `.htaccess` pipeline, `/server-info`) — it genuinely needs the
+// stream, base_dir, effective config, parsed request, body, client address,
+// keep-alive decision, proxy target, and stats simultaneously to route and
+// answer the request; a wrapper struct would not reduce this real fan-out.
 #[allow(clippy::too_many_arguments)]
 fn handle_request(
     stream: &mut Conn,
@@ -1468,7 +1484,7 @@ enum ScriptRoute {
 /// path 1 (`cgi-bin/`, location wins unconditionally, extension ignored),
 /// then path 2 (`script_handlers` extension table, built-in-table base
 /// merged under global/per-project config — see
-/// `config::builtin_script_handlers`). Returns `None` for plain static
+/// `configs::builtin_script_handlers`). Returns `None` for plain static
 /// content (no extension match, or the extension is explicitly disabled via
 /// a `null`/empty `script_handlers` entry).
 fn classify_script(base_dir: &Path, resolved: &Path, opts: &ServeOptions) -> Option<ScriptRoute> {
@@ -1579,6 +1595,12 @@ fn parse_cgi_output(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
 /// `detail` (which already includes captured stderr where available), per
 /// IDEA.md "`/server-info` diagnostics dashboard" — "full captured stderr
 /// for CGI failures".
+// Each parameter feeds a distinct part of the error response/log line this
+// builds (stream to write to, the failing request, config for error-page
+// rendering, keep-alive, the human-readable failure detail, stats to
+// record against, and the decoded path/script path for the log entry) —
+// no natural subgroup exists that would shrink this without adding
+// indirection.
 #[allow(clippy::too_many_arguments)]
 fn respond_script_failure(
     stream: &mut Conn,
@@ -1625,6 +1647,12 @@ fn respond_script_failure(
 /// stdout/stderr, and translates the script's CGI-style output into an
 /// HTTP response. No execution timeout — "No artificial resource limits"
 /// (IDEA.md "Security").
+// CGI/multi-language script dispatch (IDEA.md "CGI 1.1 / multi-language
+// scripting") needs the stream, base_dir, the resolved script path, the
+// matched route's interpreter config, the parsed request, effective
+// server config, body, client address, and whether it's a HEAD request all
+// at once to build the correct CGI environment and stream the response —
+// these are the CGI-spec-mandated inputs, not accumulated incidental state.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_script(
     stream: &mut Conn,
@@ -1757,7 +1785,7 @@ fn dispatch_script(
     cmd.env("SERVER_PROTOCOL", &request.version);
     cmd.env(
         "SERVER_SOFTWARE",
-        format!("cashttpd/{}", crate::support::version::VERSION),
+        format!("cashttpd/{}", crate::supports::version::VERSION),
     );
     cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
     cmd.env("REMOTE_ADDR", remote_addr);
@@ -1990,6 +2018,11 @@ fn content_type_for(path: &Path, opts: &ServeOptions) -> String {
     }
 }
 
+// Static-file serving (conditional requests, single-range `Range`,
+// `Content-Type` detection) needs the stream, resolved path, parsed
+// request, effective config, and the head-only/keep-alive flags together
+// to pick the right status/headers/body per RFC 7232/7233 — each is used
+// independently in that decision.
 #[allow(clippy::too_many_arguments)]
 fn serve_file(
     stream: &mut Conn,
@@ -2143,7 +2176,7 @@ fn serve_directory_listing(
         .iter()
         .map(|(e, size)| {
             let href = format!("/{e}");
-            let size_label = size.map(crate::support::format::size).unwrap_or_default();
+            let size_label = size.map(crate::supports::format::size).unwrap_or_default();
             format!(
                 "<li><a href=\"{}{href}\">{}</a><span class=\"size\">{size_label}</span></li>",
                 display_path.trim_end_matches('/'),
@@ -2297,19 +2330,19 @@ fn write_response(
 struct LogStream {
     path: PathBuf,
     file: Option<std::fs::File>,
-    rotate: crate::support::rotation::RotatePolicy,
-    keep: crate::support::rotation::KeepPolicy,
+    rotate: crate::supports::rotation::RotatePolicy,
+    keep: crate::supports::rotation::KeepPolicy,
     period_start: u64,
 }
 
 impl LogStream {
     fn open(path: PathBuf, rotate_spec: &str, keep_spec: &str) -> Self {
-        let rotate = crate::support::rotation::parse_rotate(rotate_spec);
-        let keep = crate::support::rotation::parse_keep(keep_spec);
+        let rotate = crate::supports::rotation::parse_rotate(rotate_spec);
+        let keep = crate::supports::rotation::parse_keep(keep_spec);
         // Retention is checked once at startup, to catch files that aged
         // out while the server wasn't running (IDEA.md "Retention is
         // checked at each rotation ... and once at server startup").
-        crate::support::rotation::apply_retention(&path, keep).ok();
+        crate::supports::rotation::apply_retention(&path, keep).ok();
         let period_start = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -2345,11 +2378,11 @@ impl LogStream {
             .and_then(|f| f.metadata().ok())
             .map(|m| m.len())
             .unwrap_or(0);
-        if !crate::support::rotation::should_rotate(&self.rotate, current_len, self.period_start) {
+        if !crate::supports::rotation::should_rotate(&self.rotate, current_len, self.period_start) {
             return;
         }
         self.file = None;
-        if crate::support::rotation::rotate_file(&self.path, self.keep).is_ok() {
+        if crate::supports::rotation::rotate_file(&self.path, self.keep).is_ok() {
             self.period_start = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -2386,6 +2419,11 @@ impl Logger {
         Self::open_with_policy(log_dir, name, quiet, "daily", "30d", "daily", "30d")
     }
 
+    // Log directory/name plus the independent access-log and error-log
+    // rotate/keep policies (each configurable separately per IDEA.md
+    // "Logging") must all be supplied at open time to construct both
+    // `LogStream`s correctly — collapsing the two policy pairs into one
+    // struct would only rename the same six values.
     #[allow(clippy::too_many_arguments)]
     fn open_with_policy(
         log_dir: &Path,
@@ -2413,6 +2451,10 @@ impl Logger {
         }
     }
 
+    // Mirrors the Apache "combined" access-log format's own field list
+    // (IDEA.md "Logging") — client, method, path, version, status, bytes,
+    // and headers (for referer/user-agent) are exactly the fields that
+    // format requires per line; grouping them would just wrap that spec.
     #[allow(clippy::too_many_arguments)]
     fn access(
         &self,
@@ -2485,7 +2527,7 @@ mod tests {
     }
 
     fn test_opts(base_dir: PathBuf) -> ServeOptions {
-        crate::config::Resolved {
+        crate::configs::Resolved {
             base_dir,
             listen: "127.0.0.1".to_string(),
             port: 0,
@@ -2509,25 +2551,27 @@ mod tests {
 
     #[test]
     fn parse_cli_overrides_reads_all_flags() {
+        let dir = std::env::temp_dir().join("somewhere");
+        let log = std::env::temp_dir().join("logs");
         let args = vec![
             "--listen".to_string(),
             "127.0.0.1".to_string(),
             "--port".to_string(),
             "9090".to_string(),
             "--dir".to_string(),
-            "/tmp/somewhere".to_string(),
+            dir.to_string_lossy().into_owned(),
             "--fqdn".to_string(),
             "example.test".to_string(),
             "--log".to_string(),
-            "/tmp/logs".to_string(),
+            log.to_string_lossy().into_owned(),
             "--debug".to_string(),
         ];
         let o = parse_cli_overrides(&args);
         assert_eq!(o.listen.as_deref(), Some("127.0.0.1"));
         assert_eq!(o.port, Some(9090));
-        assert_eq!(o.base_dir, Some(PathBuf::from("/tmp/somewhere")));
+        assert_eq!(o.base_dir, Some(dir));
         assert_eq!(o.fqdn.as_deref(), Some("example.test"));
-        assert_eq!(o.log_dir, Some(PathBuf::from("/tmp/logs")));
+        assert_eq!(o.log_dir, Some(log));
         assert_eq!(o.debug, Some(true));
     }
 
@@ -3366,11 +3410,11 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
         }
 
-        let cli = crate::config::CliOverrides {
+        let cli = crate::configs::CliOverrides {
             base_dir: Some(base_dir.clone()),
             ..Default::default()
         };
-        let opts = crate::config::load(&cli, true).unwrap();
+        let opts = crate::configs::load(&cli, true).unwrap();
 
         let mut listener = TcpListener::bind(format_bind_addr(&opts)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3436,7 +3480,7 @@ mod tests {
     // project config's own `base_dir` key only overrides anything when the
     // *original* `CliOverrides.base_dir` is `None` and `CASHTTPD_BASE_DIR`
     // is unset (config/mod.rs `load`'s documented precedence), which in
-    // turn means the very first `config::load` call also can't be pointed
+    // turn means the very first `configs::load` call also can't be pointed
     // at an isolated per-test directory via `cli`/the env var — it would
     // have to fall back to `base_dir = "."`, i.e. the real process cwd,
     // shared and racy across every test in this binary. The `base_dir`

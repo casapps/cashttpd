@@ -470,6 +470,12 @@ impl Stats {
 
     /// Records one occurrence of a tracked issue, grouped by
     /// `(kind, path, cause)` (IDEA.md "Grouping and lifecycle").
+    // Each parameter is one field of the `Occurrence`/grouping key this
+    // records (IDEA.md "Grouping and lifecycle" needs kind+path+cause for
+    // the group, plus method/target/status/referer for the occurrence
+    // detail shown per-group) — collapsing them into a struct here would
+    // just move the same fields one level out without reducing what call
+    // sites (scattered across request handling) have to supply.
     #[allow(clippy::too_many_arguments)]
     pub fn record_issue(
         &self,
@@ -503,7 +509,7 @@ pub fn render_dashboard(
     opts: &ServeOptions,
     proxy_target: Option<&super::proxy::ProxyTarget>,
 ) -> String {
-    let uptime = crate::support::format::duration(stats.started_at.elapsed().as_secs());
+    let uptime = crate::supports::format::duration(stats.started_at.elapsed().as_secs());
     let started_at = super::format_http_date(stats.start_wall_secs);
 
     let overview = render_overview(stats, opts, proxy_target, &uptime, &started_at);
@@ -636,8 +642,8 @@ fn render_totals(stats: &Stats) -> String {
          </div>\
          <table><tr><th>By method</th><th></th></tr>{by_method_rows}</table>\
          <table><tr><th>By status</th><th></th></tr>{by_status_rows}</table>",
-        crate::support::format::size(bytes_sent),
-        crate::support::format::size(bytes_received),
+        crate::supports::format::size(bytes_sent),
+        crate::supports::format::size(bytes_received),
     )
 }
 
@@ -774,11 +780,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_opts() -> ServeOptions {
-        crate::config::Resolved {
-            base_dir: PathBuf::from("/tmp"),
+        crate::configs::Resolved {
+            base_dir: std::env::temp_dir(),
             listen: "127.0.0.1".to_string(),
             port: 8080,
-            log_dir: PathBuf::from("/tmp"),
+            log_dir: std::env::temp_dir(),
             debug: false,
             fqdn: None,
             tls_enabled: false,
