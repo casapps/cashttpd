@@ -31,13 +31,16 @@ COPY . .
 # for the target) fails with "rust-lld: error: unable to find library
 # -lgcc_s" / "-lc" on aarch64 because casjaysdev/rust:latest ships neither
 # package (confirmed via a real CI run: the identical x86_64 build succeeds
-# without them). `gcc`+`musl-dev` supply those two static libraries from
-# Alpine's own packages, which is enough for rust-lld to resolve them.
+# without them). `gcc`+`musl-dev` install those two libraries into
+# /usr/lib (confirmed via `apk info -L`), but rust-lld's invocation only
+# passes `-L` for the rustlib sysroot and the raw-dylibs dir, never
+# /usr/lib — so the packages alone are not enough; RUSTFLAGS="-L /usr/lib"
+# below adds the missing search path so rust-lld can actually find them.
 RUN apk add --no-cache gcc musl-dev
 RUN set -eu; \
     case "$(uname -m)" in \
       x86_64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-      aarch64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+      aarch64) RUST_TARGET="aarch64-unknown-linux-musl"; export RUSTFLAGS="-L /usr/lib" ;; \
       *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     cargo build --release --target "${RUST_TARGET}"; \
