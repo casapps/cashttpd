@@ -12,10 +12,12 @@
 //! The Let's-Encrypt-live-cert validity check and the ACME HTTP-01 client's
 //! HTTP/1.1 framing are both hand-rolled rather than pulled in via
 //! `x509-parser`/`ureq` — see the long comment above the `rustls` block in
-//! `Cargo.toml` for why: this project's mandated Docker toolchain
-//! (`casjaysdev/rust:latest`) cannot compile proc-macro crates at all
-//! (`rustc -vV` reports a musl host), and both of those crates pull one in
-//! transitively.
+//! `Cargo.toml` for why.
+//!
+//! Connection termination itself lives in `servers::mod` (TCP, via
+//! `tokio_rustls`) and `servers::http3` (QUIC, via `quinn`); this module only
+//! resolves the certificate and hands back the two `rustls::ServerConfig`
+//! values those two listeners need — see `TlsSetup`.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -26,46 +28,17 @@ use std::time::Duration;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// Either half of a connection this server terminates — a plain TCP socket,
-/// or one wrapped in a TLS server session. Read/Write are delegated so the
-/// rest of `servers::mod` (request parsing, response writing, CGI plumbing)
-/// stays oblivious to whether TLS is in play.
-pub enum Conn {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
-}
-
-impl Conn {
-    pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        match self {
-            Conn::Plain(s) => s.set_read_timeout(dur),
-            Conn::Tls(s) => s.sock.set_read_timeout(dur),
-        }
-    }
-}
-
-impl Read for Conn {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Conn::Plain(s) => s.read(buf),
-            Conn::Tls(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for Conn {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Conn::Plain(s) => s.write(buf),
-            Conn::Tls(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Conn::Plain(s) => s.flush(),
-            Conn::Tls(s) => s.flush(),
-        }
-    }
+/// The two `rustls::ServerConfig` values one certificate resolution produces,
+/// differing only in their ALPN protocol list (IDEA.md "Protocol version
+/// negotiation"). Both are built from a single resolution pass so a startup
+/// that has to generate a self-signed cert — or run the ACME HTTP-01 flow —
+/// does that work exactly once.
+pub struct TlsSetup {
+    /// TCP listener config: ALPN `h2`, `http/1.1` (RFC 9113 §3.2 / RFC 9112).
+    pub tcp: Arc<rustls::ServerConfig>,
+    /// QUIC listener config: ALPN `h3` only (RFC 9114 §3.1), TLS 1.3 only —
+    /// QUIC has no TLS 1.2 mode.
+    pub quic: Arc<rustls::ServerConfig>,
 }
 
 /// `{data_dir}/certs/{derived_name}/` — where self-generated/obtained certs
@@ -76,24 +49,48 @@ pub fn cert_dir(base_dir: &Path) -> PathBuf {
         .join(crate::configs::derived_name(base_dir))
 }
 
-/// Builds the `rustls::ServerConfig` to terminate HTTPS with, running the
-/// full three-tier resolution. Requires `fqdn` — callers must already have
-/// enforced the `--fqdn`-required-when-`tls.enabled` fail-fast rule.
+/// Builds the `rustls::ServerConfig` pair to terminate HTTPS with, running
+/// the full three-tier resolution once. Requires `fqdn` — callers must
+/// already have enforced the `--fqdn`-required-when-`tls.enabled` fail-fast
+/// rule.
 pub fn build_server_config(
     fqdn: &str,
     listen: &str,
     base_dir: &Path,
     log_warning: impl Fn(&str),
-) -> io::Result<Arc<rustls::ServerConfig>> {
+) -> io::Result<TlsSetup> {
     let dir = cert_dir(base_dir);
     let (chain, key) = resolve_certificate(fqdn, listen, &dir, &log_warning)?;
 
-    let mut config = rustls::ServerConfig::builder()
+    let mut tcp = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain.clone(), key.clone_key())
+        .map_err(|err| io::Error::other(format!("invalid TLS certificate/key: {err}")))?;
+    // Order is the server's preference order: HTTP/2 first, HTTP/1.1 as the
+    // floor for clients that offer neither or only `http/1.1`. A client that
+    // advertises no ALPN at all gets HTTP/1.1 (rustls leaves the negotiated
+    // protocol `None`), which is what the demux in `servers::mod` treats as
+    // the default — never HTTP/2, so a silent h1-framing/h2-framing mismatch
+    // is not reachable.
+    tcp.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    // QUIC (RFC 9000 §4) requires TLS 1.3; a config that also offered TLS 1.2
+    // would be rejected by `quinn` at conversion time. Building it against an
+    // explicit TLS-1.3-only protocol list makes that a compile-time-shaped
+    // guarantee rather than a runtime surprise.
+    let mut quic = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(|err| io::Error::other(format!("invalid TLS certificate/key: {err}")))?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    quic.alpn_protocols = vec![b"h3".to_vec()];
+    // 0-RTT stays off (rustls' default `max_early_data_size` of 0). QUIC
+    // 0-RTT data is replayable by an on-path attacker (RFC 9001 §9.2), and
+    // this server has no request-idempotency filter to make that safe.
+
+    Ok(TlsSetup {
+        tcp: Arc::new(tcp),
+        quic: Arc::new(quic),
+    })
 }
 
 fn resolve_certificate(

@@ -31,13 +31,17 @@
 //! under `path_prefix` receive an embedded auto-refreshing "starting…" page
 //! instead of a hard error.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use super::tls::Conn;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Response, StatusCode};
+use hyper_util::rt::TokioIo;
+
 use super::{Request, ServeOptions};
 
 /// One built-in framework profile: marker-file detection plus its default
@@ -259,14 +263,21 @@ pub fn spawn_child(target: &ProxyTarget, base_dir: &Path) -> io::Result<Child> {
 /// Bounded liveness probe (the one timeout IDEA.md's "no artificial
 /// resource limits" policy explicitly permits) — used only to decide
 /// whether to relay a real request or serve the embedded "starting…" page.
-pub fn is_upstream_ready(upstream: &str) -> bool {
+pub async fn is_upstream_ready(upstream: &str) -> bool {
     let Ok(mut addrs) = upstream.to_socket_addrs() else {
         return false;
     };
     let Some(addr) = addrs.next() else {
         return false;
     };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Embedded auto-refreshing "framework is starting…" page, styled to match
@@ -295,45 +306,46 @@ fn starting_page(request: &Request) -> String {
     )
 }
 
-/// Forwards `request`/`body` to `target.upstream` and relays the response
-/// back to `stream`, streamed rather than buffered. See the module doc
-/// comment for the exact request/response fidelity rules.
-// Each parameter is an independent piece of per-request proxy state
-// (connection, matched target, parsed request, already-read body, client
-// address, effective server config, keep-alive decision) that the caller
-// already has on hand from the request-dispatch loop — bundling them into a
-// struct would only add an indirection layer without reducing the actual
-// information this function needs to relay the request upstream and stream
-// the response back.
+/// Forwards `request`/`body` to `target.upstream` and returns the upstream
+/// response for relaying back to the client. See the module doc comment for
+/// the exact request/response fidelity rules.
+///
+/// The response body is handed back as `hyper`'s streaming `Incoming` body
+/// rather than being collected, so a large or long-lived (SSE/HMR) upstream
+/// response still reaches the client incrementally — the same property the
+/// previous hand-rolled chunk relay had, now with `hyper` owning the
+/// HTTP/1.1 framing on both hops.
+// Each parameter is an independent piece of per-request proxy state (matched
+// target, parsed request, already-read body, client address, effective server
+// config, and the client's pending protocol upgrade) that the caller already
+// has on hand from request dispatch — bundling them into a struct would only
+// add an indirection layer without reducing the information this function
+// needs.
 #[allow(clippy::too_many_arguments)]
-pub fn proxy_request(
-    stream: &mut Conn,
+pub async fn proxy_request(
     target: &ProxyTarget,
     request: &Request,
     body: &[u8],
     client: &str,
     opts: &ServeOptions,
-    keep_alive: bool,
-) -> io::Result<(u16, u64)> {
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> io::Result<Response<super::Body>> {
     let head_only = request.method == "HEAD";
 
-    if !is_upstream_ready(&target.upstream) {
+    if !is_upstream_ready(&target.upstream).await {
         let page = starting_page(request);
-        return super::write_response(
-            stream,
-            503,
-            "Service Unavailable",
-            page.as_bytes(),
-            head_only,
-            keep_alive,
-            &[
-                (
-                    "Content-Type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                ),
-                ("Retry-After".to_string(), "1".to_string()),
-            ],
-        );
+        let mut headers = vec![
+            (
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ),
+            ("Retry-After".to_string(), "1".to_string()),
+        ];
+        if head_only {
+            headers.push(("Content-Length".to_string(), page.len().to_string()));
+            return super::build_response(503, "Service Unavailable", Bytes::new(), &headers);
+        }
+        return super::build_response(503, "Service Unavailable", Bytes::from(page), &headers);
     }
 
     let is_websocket = request
@@ -345,323 +357,229 @@ pub fn proxy_request(
             .get("connection")
             .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
 
-    let mut upstream = match TcpStream::connect(&target.upstream) {
+    let remote_ip = client.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(client);
+    let upstream_request =
+        match build_upstream_request(request, body, remote_ip, opts, is_websocket) {
+            Ok(req) => req,
+            Err(err) => {
+                let detail = format!("could not build upstream request: {err}");
+                return bad_gateway(request, opts, &detail);
+            }
+        };
+
+    let socket = match tokio::net::TcpStream::connect(&target.upstream).await {
         Ok(s) => s,
         Err(err) => {
             let detail = format!("failed to connect to upstream {}: {err}", target.upstream);
-            return bad_gateway(stream, request, opts, keep_alive, &detail);
+            return bad_gateway(request, opts, &detail);
         }
     };
+    let _ = socket.set_nodelay(true);
 
-    let remote_ip = client.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(client);
-    if let Err(err) =
-        write_upstream_request(&mut upstream, request, body, remote_ip, opts, is_websocket)
-    {
-        let detail = format!("failed to write request to upstream: {err}");
-        return bad_gateway(stream, request, opts, keep_alive, &detail);
-    }
+    let (mut sender, connection) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(socket)).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                let detail = format!("upstream HTTP/1.1 handshake failed: {err}");
+                return bad_gateway(request, opts, &detail);
+            }
+        };
+    // `with_upgrades` keeps the connection task alive past a 101 so the
+    // WebSocket relay below can take ownership of the raw socket (RFC 6455
+    // §4.2.2); it is harmless for ordinary responses.
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
 
-    let mut reader = BufReader::new(&upstream);
-    let (status, reason, headers) = match read_upstream_status_and_headers(&mut reader) {
-        Ok(v) => v,
+    let upstream_response = match sender.send_request(upstream_request).await {
+        Ok(resp) => resp,
         Err(err) => {
             let detail = format!("upstream produced no usable response: {err}");
-            return bad_gateway(stream, request, opts, keep_alive, &detail);
+            return bad_gateway(request, opts, &detail);
         }
     };
 
-    if is_websocket && status == 101 {
-        write_status_and_headers(stream, status, &reason, &headers)?;
-        stream.flush()?;
-        drop(reader);
-        let bytes = relay_bidirectional(stream, &mut upstream)?;
-        return Ok((status, bytes));
+    let status = upstream_response.status();
+
+    if is_websocket && status == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(relay_upgrade(upstream_response, upgrade));
     }
 
-    let framing = response_framing(&headers, head_only, status);
-    write_status_and_headers(stream, status, &reason, &headers)?;
-    let bytes = if head_only {
-        0
-    } else {
-        stream_body(&mut reader, stream, framing)?
-    };
-    stream.flush()?;
-    Ok((status, bytes))
+    // A non-101 response ends this hop's interest in the client's pending
+    // upgrade — dropping it makes `hyper` finish the request normally
+    // instead of leaving a half-upgraded connection.
+    drop(upgrade);
+
+    let (parts, incoming) = upstream_response.into_parts();
+    let mut response = Response::new(incoming.map_err(io::Error::other).boxed());
+    *response.status_mut() = parts.status;
+    copy_relayable_headers(&parts.headers, response.headers_mut(), false);
+    Ok(response)
+}
+
+/// Completes a WebSocket/`Upgrade` handshake in both directions (RFC 6455
+/// §4.2.2): the 101 and its handshake headers go back to the client, and once
+/// both sides have finished switching protocols the two raw byte streams are
+/// spliced together. `copy_bidirectional` replaces the previous poll loop —
+/// with each side owned by an independent async half there is no longer a
+/// single non-splittable TLS state machine forcing a timeout-poll design.
+fn relay_upgrade(
+    mut upstream_response: Response<hyper::body::Incoming>,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Response<super::Body> {
+    let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
+    let parts = upstream_response.into_parts().0;
+
+    if let Some(client_upgrade) = client_upgrade {
+        tokio::spawn(async move {
+            let (Ok(client_io), Ok(upstream_io)) = tokio::join!(client_upgrade, upstream_upgrade)
+            else {
+                return;
+            };
+            let mut client_io = TokioIo::new(client_io);
+            let mut upstream_io = TokioIo::new(upstream_io);
+            let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await;
+        });
+    }
+
+    let mut response = Response::new(super::full_body(Bytes::new()));
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    // The 101's own `Connection: Upgrade` / `Upgrade:` headers are part of
+    // the handshake the client must see, so they are relayed here even though
+    // they are hop-by-hop for every other status.
+    copy_relayable_headers(&parts.headers, response.headers_mut(), true);
+    response
+}
+
+/// Copies upstream response headers onto the client-facing response, dropping
+/// the hop-by-hop set (RFC 9110 §7.6.1). Forwarding `Transfer-Encoding` or
+/// `Content-Length` verbatim would now contradict the framing `hyper` picks
+/// for the outgoing message — the classic request/response smuggling
+/// desync — and neither is meaningful on HTTP/2 or HTTP/3, where this same
+/// response may be sent (RFC 9113 §8.2.2).
+fn copy_relayable_headers(from: &http::HeaderMap, into: &mut http::HeaderMap, keep_upgrade: bool) {
+    for (name, value) in from.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        let hop_by_hop = matches!(
+            lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "content-length"
+        ) || (lower == "upgrade" && !keep_upgrade);
+        if hop_by_hop && !(keep_upgrade && (lower == "connection" || lower == "upgrade")) {
+            continue;
+        }
+        into.append(name.clone(), value.clone());
+    }
 }
 
 fn bad_gateway(
-    stream: &mut Conn,
     request: &Request,
     opts: &ServeOptions,
-    keep_alive: bool,
     detail: &str,
-) -> io::Result<(u16, u64)> {
+) -> io::Result<Response<super::Body>> {
     let page = super::error_page_with_trace(502, request, opts.debug, Some(detail));
-    super::write_response(
-        stream,
-        502,
-        "Bad Gateway",
-        page.as_bytes(),
-        request.method == "HEAD",
-        keep_alive,
-        &[(
-            "Content-Type".to_string(),
-            "text/html; charset=utf-8".to_string(),
-        )],
-    )
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    )];
+    if request.method == "HEAD" {
+        headers.push(("Content-Length".to_string(), page.len().to_string()));
+        return super::build_response(502, "Bad Gateway", Bytes::new(), &headers);
+    }
+    super::build_response(502, "Bad Gateway", Bytes::from(page), &headers)
 }
 
-// Mirrors `proxy_request`'s parameter shape one call down: the upstream
-// socket plus the same already-parsed request/body/client/config values are
-// each used independently while rewriting and forwarding the request line
-// and headers — grouping them would not shrink the real per-call state.
-#[allow(clippy::too_many_arguments)]
-fn write_upstream_request(
-    upstream: &mut TcpStream,
+/// Header names that describe *this* hop's connection and must never be
+/// forwarded to the next one (RFC 9110 §7.6.1). Passing `Transfer-Encoding`
+/// or `Content-Length` through while `hyper` independently frames the
+/// outgoing request is exactly the TE/CL disagreement that request smuggling
+/// exploits, so both are dropped and the framing is recomputed from the body
+/// this server actually holds.
+fn is_hop_by_hop_request_header(name: &str, is_websocket: bool) -> bool {
+    match name {
+        "connection"
+        | "keep-alive"
+        | "proxy-authenticate"
+        | "proxy-authorization"
+        | "proxy-connection"
+        | "te"
+        | "trailer"
+        | "transfer-encoding"
+        | "content-length" => true,
+        "upgrade" => !is_websocket,
+        _ => false,
+    }
+}
+
+/// Builds the upstream request: the client's own request line and headers
+/// forwarded verbatim (including `Host`), minus the hop-by-hop set, plus the
+/// `X-Forwarded-*` pair.
+fn build_upstream_request(
     request: &Request,
     body: &[u8],
     remote_ip: &str,
     opts: &ServeOptions,
     is_websocket: bool,
-) -> io::Result<()> {
-    let mut head = format!("{} {} HTTP/1.1\r\n", request.method, request.path);
+) -> io::Result<hyper::Request<Full<Bytes>>> {
+    let method = http::Method::from_bytes(request.method.as_bytes())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let uri: http::Uri = request
+        .path
+        .parse()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-    // Hop-by-hop between client and cashttpd only — a fresh connection is
-    // opened to the upstream per proxied request (RFC 9110 §7.6.1), so the
-    // client's own `Connection` value governs a different hop and is
-    // replaced below rather than forwarded. Every other header, including
-    // `Host`, is forwarded verbatim (IDEA.md "Request fidelity").
-    for (k, v) in &request.headers {
-        if k == "connection" {
-            continue;
-        }
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
+    let mut builder = hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(http::Version::HTTP_11);
 
-    // X-Forwarded-* — appended to (never overwriting) any value already
-    // present from a further upstream hop.
-    let xff = match request.headers.get("x-forwarded-for") {
-        Some(existing) => format!("{existing}, {remote_ip}"),
-        None => remote_ip.to_string(),
-    };
-    head.push_str(&format!("X-Forwarded-For: {xff}\r\n"));
-    let proto = if opts.tls_enabled { "https" } else { "http" };
-    let xfp = match request.headers.get("x-forwarded-proto") {
-        Some(existing) => format!("{existing}, {proto}"),
-        None => proto.to_string(),
-    };
-    head.push_str(&format!("X-Forwarded-Proto: {xfp}\r\n"));
-    head.push_str(if is_websocket {
-        "Connection: Upgrade\r\n"
-    } else {
-        "Connection: close\r\n"
-    });
-    head.push_str("\r\n");
-
-    upstream.write_all(head.as_bytes())?;
-    if !body.is_empty() {
-        upstream.write_all(body)?;
-    }
-    upstream.flush()
-}
-
-/// Status code, reason phrase, and ordered (possibly duplicated) headers
-/// read from an upstream dev-server response.
-type UpstreamResponseHead = (u16, String, Vec<(String, String)>);
-
-fn read_upstream_status_and_headers(
-    reader: &mut BufReader<&TcpStream>,
-) -> io::Result<UpstreamResponseHead> {
-    let mut status_line = String::new();
-    if reader.read_line(&mut status_line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "empty response from upstream",
-        ));
-    }
-    let status_line = status_line.trim_end();
-    let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next().unwrap_or("HTTP/1.1");
-    let status: u16 = parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "malformed upstream status line")
-    })?;
-    let reason = parts.next().unwrap_or("").to_string();
-
-    let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-    Ok((status, reason, headers))
-}
-
-fn write_status_and_headers(
-    stream: &mut Conn,
-    status: u16,
-    reason: &str,
-    headers: &[(String, String)],
-) -> io::Result<()> {
-    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
-    for (k, v) in headers {
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes())
-}
-
-enum Framing {
-    None,
-    Length(u64),
-    Chunked,
-    UntilClose,
-}
-
-fn response_framing(headers: &[(String, String)], head_only: bool, status: u16) -> Framing {
-    if head_only || status == 204 || status == 304 || (100..200).contains(&status) {
-        return Framing::None;
-    }
-    if headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
-    }) {
-        return Framing::Chunked;
-    }
-    if let Some((_, v)) = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-    {
-        if let Ok(n) = v.trim().parse() {
-            return Framing::Length(n);
-        }
-    }
-    Framing::UntilClose
-}
-
-/// Streams the response body from `reader` to `out` without buffering it
-/// fully in memory, per the framing determined from the upstream's own
-/// response headers.
-fn stream_body(
-    reader: &mut BufReader<&TcpStream>,
-    out: &mut Conn,
-    framing: Framing,
-) -> io::Result<u64> {
-    match framing {
-        Framing::None => Ok(0),
-        Framing::Length(n) => {
-            let mut remaining = n;
-            let mut buf = [0u8; 65536];
-            while remaining > 0 {
-                let take = remaining.min(buf.len() as u64) as usize;
-                let read = reader.read(&mut buf[..take])?;
-                if read == 0 {
-                    break;
-                }
-                out.write_all(&buf[..read])?;
-                remaining -= read as u64;
+    if let Some(headers) = builder.headers_mut() {
+        for (k, v) in &request.headers {
+            if is_hop_by_hop_request_header(k, is_websocket) {
+                continue;
             }
-            Ok(n - remaining)
+            let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = http::HeaderValue::from_str(v) else {
+                continue;
+            };
+            headers.append(name, value);
         }
-        Framing::Chunked => stream_chunked(reader, out),
-        Framing::UntilClose => {
-            let mut buf = [0u8; 65536];
-            let mut total = 0u64;
-            loop {
-                let read = reader.read(&mut buf)?;
-                if read == 0 {
-                    break;
-                }
-                out.write_all(&buf[..read])?;
-                total += read as u64;
-            }
-            Ok(total)
-        }
-    }
-}
 
-/// Relays a `Transfer-Encoding: chunked` body chunk-by-chunk, verbatim —
-/// no decode/re-encode round trip, just the chunk-size lines and payloads
-/// (plus any trailer headers) passed straight through.
-fn stream_chunked(reader: &mut BufReader<&TcpStream>, out: &mut Conn) -> io::Result<u64> {
-    let mut total = 0u64;
-    loop {
-        let mut size_line = String::new();
-        if reader.read_line(&mut size_line)? == 0 {
-            break;
+        // X-Forwarded-* — appended to (never overwriting) any value already
+        // present from a further upstream hop.
+        let xff = match request.headers.get("x-forwarded-for") {
+            Some(existing) => format!("{existing}, {remote_ip}"),
+            None => remote_ip.to_string(),
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&xff) {
+            headers.insert("x-forwarded-for", value);
         }
-        out.write_all(size_line.as_bytes())?;
-        let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-        if size == 0 {
-            loop {
-                let mut trailer = String::new();
-                if reader.read_line(&mut trailer)? == 0 {
-                    break;
-                }
-                out.write_all(trailer.as_bytes())?;
-                if trailer.trim().is_empty() {
-                    break;
-                }
-            }
-            break;
+        let proto = if opts.tls_enabled { "https" } else { "http" };
+        let xfp = match request.headers.get("x-forwarded-proto") {
+            Some(existing) => format!("{existing}, {proto}"),
+            None => proto.to_string(),
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&xfp) {
+            headers.insert("x-forwarded-proto", value);
         }
-        let mut data = vec![0u8; size + 2];
-        reader.read_exact(&mut data)?;
-        out.write_all(&data)?;
-        total += size as u64;
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static(if is_websocket { "Upgrade" } else { "close" }),
+        );
     }
-    Ok(total)
-}
 
-fn is_timeout(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
-}
-
-/// Raw bidirectional byte relay after a successful WebSocket/`Upgrade`
-/// handshake (RFC 6455). A short-timeout poll loop on the calling thread,
-/// rather than one thread per direction: it avoids ever needing two live
-/// `&mut` handles onto the same `Conn` — the TLS variant wraps a single
-/// `rustls::ServerConnection` state machine that isn't safely splittable
-/// across concurrent reader/writer threads without a shared lock, and a
-/// lock held across a blocking read would risk one idle direction
-/// stalling the other. WebSocket/HMR traffic is low-bandwidth enough that
-/// the poll overhead is immaterial.
-fn relay_bidirectional(client: &mut Conn, upstream: &mut TcpStream) -> io::Result<u64> {
-    client.set_read_timeout(Some(Duration::from_millis(100)))?;
-    upstream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let mut buf = [0u8; 8192];
-    let mut total = 0u64;
-    loop {
-        match client.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                upstream.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            Err(err) if is_timeout(&err) => {}
-            Err(err) => return Err(err),
-        }
-        match upstream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                client.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            Err(err) if is_timeout(&err) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(total)
+    builder
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 #[cfg(test)]
@@ -844,16 +762,24 @@ mod tests {
         assert_eq!(target.path_prefix, "/app");
     }
 
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
     #[test]
     fn is_upstream_ready_false_for_unbound_port() {
-        assert!(!is_upstream_ready("127.0.0.1:1"));
+        assert!(!block_on(is_upstream_ready("127.0.0.1:1")));
     }
 
     #[test]
     fn is_upstream_ready_true_for_bound_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        assert!(is_upstream_ready(&addr.to_string()));
+        assert!(block_on(is_upstream_ready(&addr.to_string())));
     }
 
     #[test]
@@ -873,12 +799,7 @@ mod tests {
     /// than overwrite, Host is forwarded unmodified, and the client's own
     /// `Connection` header is replaced (hop-by-hop) rather than forwarded.
     #[test]
-    fn write_upstream_request_appends_forwarded_headers_and_keeps_host() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
-
+    fn build_upstream_request_appends_forwarded_headers_and_keeps_host() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("host".to_string(), "app.example.test".to_string());
         headers.insert("x-forwarded-for".to_string(), "10.0.0.1".to_string());
@@ -889,31 +810,21 @@ mod tests {
             version: "HTTP/1.1".to_string(),
             headers,
         };
-        let dir = make_dir("write-upstream");
+        let dir = make_dir("build-upstream");
         let opts = test_opts(dir);
 
-        write_upstream_request(&mut client, &request, b"", "192.0.2.5", &opts, false).unwrap();
-        drop(client);
+        let built = build_upstream_request(&request, b"", "192.0.2.5", &opts, false).unwrap();
 
-        let mut received = Vec::new();
-        server.read_to_end(&mut received).unwrap();
-        let text = String::from_utf8_lossy(&received);
-
-        assert!(text.starts_with("GET /api/things?x=1 HTTP/1.1\r\n"));
-        assert!(text.contains("host: app.example.test\r\n"));
-        assert!(text.contains("X-Forwarded-For: 10.0.0.1, 192.0.2.5\r\n"));
-        assert!(text.contains("X-Forwarded-Proto: http\r\n"));
-        assert!(text.contains("Connection: close\r\n"));
-        assert!(!text.contains("connection: keep-alive"));
+        assert_eq!(built.method(), http::Method::GET);
+        assert_eq!(built.uri().path_and_query().unwrap(), "/api/things?x=1");
+        assert_eq!(built.headers()["host"], "app.example.test");
+        assert_eq!(built.headers()["x-forwarded-for"], "10.0.0.1, 192.0.2.5");
+        assert_eq!(built.headers()["x-forwarded-proto"], "http");
+        assert_eq!(built.headers()["connection"], "close");
     }
 
     #[test]
-    fn write_upstream_request_uses_upgrade_connection_for_websocket() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
-
+    fn build_upstream_request_uses_upgrade_connection_for_websocket() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("upgrade".to_string(), "websocket".to_string());
         headers.insert("connection".to_string(), "Upgrade".to_string());
@@ -923,15 +834,64 @@ mod tests {
             version: "HTTP/1.1".to_string(),
             headers,
         };
-        let dir = make_dir("write-upstream-ws");
+        let dir = make_dir("build-upstream-ws");
         let opts = test_opts(dir);
 
-        write_upstream_request(&mut client, &request, b"", "192.0.2.5", &opts, true).unwrap();
-        drop(client);
+        let built = build_upstream_request(&request, b"", "192.0.2.5", &opts, true).unwrap();
+        assert_eq!(built.headers()["connection"], "Upgrade");
+        assert_eq!(built.headers()["upgrade"], "websocket");
+    }
 
-        let mut received = Vec::new();
-        server.read_to_end(&mut received).unwrap();
-        let text = String::from_utf8_lossy(&received);
-        assert!(text.contains("Connection: Upgrade\r\n"));
+    /// Hop-by-hop request headers must never reach the upstream: forwarding
+    /// `Transfer-Encoding` or `Content-Length` alongside the body `hyper`
+    /// re-frames is the TE/CL disagreement request smuggling relies on.
+    #[test]
+    fn build_upstream_request_drops_hop_by_hop_framing_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        headers.insert("content-length".to_string(), "9999".to_string());
+        headers.insert("te".to_string(), "trailers".to_string());
+        headers.insert("upgrade".to_string(), "h2c".to_string());
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/submit".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers,
+        };
+        let dir = make_dir("build-upstream-smuggle");
+        let opts = test_opts(dir);
+
+        let built = build_upstream_request(&request, b"hello", "192.0.2.5", &opts, false).unwrap();
+        assert!(!built.headers().contains_key("transfer-encoding"));
+        assert!(!built.headers().contains_key("te"));
+        assert!(!built.headers().contains_key("upgrade"));
+        assert_eq!(built.headers().get("content-length"), None);
+    }
+
+    /// Hop-by-hop response headers are stripped on the way back for the same
+    /// reason, except on a 101 where `Connection`/`Upgrade` are the handshake.
+    #[test]
+    fn copy_relayable_headers_strips_hop_by_hop_except_on_upgrade() {
+        let mut from = http::HeaderMap::new();
+        from.insert("content-type", http::HeaderValue::from_static("text/html"));
+        from.insert(
+            "transfer-encoding",
+            http::HeaderValue::from_static("chunked"),
+        );
+        from.insert("connection", http::HeaderValue::from_static("Upgrade"));
+        from.insert("upgrade", http::HeaderValue::from_static("websocket"));
+
+        let mut plain = http::HeaderMap::new();
+        copy_relayable_headers(&from, &mut plain, false);
+        assert_eq!(plain["content-type"], "text/html");
+        assert!(!plain.contains_key("transfer-encoding"));
+        assert!(!plain.contains_key("connection"));
+        assert!(!plain.contains_key("upgrade"));
+
+        let mut switching = http::HeaderMap::new();
+        copy_relayable_headers(&from, &mut switching, true);
+        assert_eq!(switching["connection"], "Upgrade");
+        assert_eq!(switching["upgrade"], "websocket");
+        assert!(!switching.contains_key("transfer-encoding"));
     }
 }

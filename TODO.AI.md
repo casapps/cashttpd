@@ -318,3 +318,36 @@ container naming, `docker/setup-buildx-action` v4.1.0 bump, TruffleHog
 scan-range step + `--results=verified,unknown`) were cross-checked and
 ported into `.github/`, `.gitea/`, and `.forgejo/` `ci.yml`/`release.yml`
 where applicable.
+
+## [ ] `Upgrade: h2c` handshake (RFC 9113 §3.2) is not implemented
+Read: IDEA.md "Core behavior" → "Protocol version negotiation"; AI.md PART 9
+Cleartext HTTP/2 is supported today only in its prior-knowledge form (RFC 9113 §3.4) — a client
+that opens with the HTTP/2 connection preface is auto-detected by `hyper_util`'s
+`server::conn::auto::Builder` in `servers::serve_http` and served over HTTP/2. The
+`Upgrade: h2c` + `HTTP2-Settings` 101 handshake is *not* implemented: the mandated crate stack
+(hyper 1.x over the `h2` crate) exposes no API for synthesizing the upgraded connection's
+half-closed stream 1 from an already-parsed HTTP/1.1 request, so there is no way to complete the
+handshake without either forking `h2` or hand-rolling HTTP/2 framing — both rejected. Requests
+carrying `Upgrade: h2c` are therefore served over HTTP/1.1, which is the fallback RFC 9113 §3.2
+itself sanctions ("a server that does not support HTTP/2 ... responds to the request as though
+the Upgrade header field were absent"). Revisit if hyper/h2 grows a supported upgrade entry
+point. Note that no major browser ever shipped `Upgrade: h2c`, so this affects only
+h2c-upgrade-capable CLI clients (`curl --http2` against a plain-HTTP listener, which falls back
+cleanly to HTTP/1.1; `curl --http2-prior-knowledge` gets real HTTP/2).
+
+## [ ] rust-lint findings (pre-existing, unrelated to current work) — 18 issues
+Read: `~/.claude/memory/rust_conventions.md`, `.github/workflows/release.yml`,
+`.gitea/workflows/release.yml`, `.forgejo/workflows/release.yml`, `src/configs/mod.rs`,
+`src/uis/cli/mod.rs`
+Found by the `rust-lint` agent while gating the HTTP/2+HTTP/3 commit; none of these touch files
+modified by that feature (`Cargo.lock`/`Makefile`/`src/servers/**`) or by the docker-packaging/
+spec-doc work from the same session, so they are logged here rather than folded into an
+unrelated commit:
+- **`Cargo.toml`**: `edition = "2024"` — convention requires `"2021"`.
+- **`src/configs/mod.rs`**: `#[allow(dead_code)]` at lines 176, 180, 184 — each needs an
+  explanatory comment above it per the comment-conventions rule (no bare `#[allow(...)]`).
+- **`src/uis/cli/mod.rs`**: `--color` flag is missing from the CLI definition (required values:
+  `auto`/`yes`/`no`).
+- **Binary naming in release workflows** (`.github/`, `.gitea/`, `.forgejo/` `release.yml` lines
+  54–59, identical in all three): output names use `amd64`/`arm64`/`darwin` — convention
+  requires `x86_64`/`aarch64`/`macos`.

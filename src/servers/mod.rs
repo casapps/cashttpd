@@ -47,13 +47,36 @@
 //! dropped) is logged as a warning and recorded on the `/server-info`
 //! dashboard, never silently ignored or a crash.
 //!
-//! Request bodies also support `Transfer-Encoding: chunked` (RFC 7230
-//! §4.1) in addition to `Content-Length`: `read_chunked_body` decodes the
-//! classic chunk-size/chunk-data/CRLF framing (chunk-extensions and
-//! trailer headers are read and discarded, never merged into the parsed
-//! request's headers), taking precedence over any `Content-Length` present
-//! on the same message per RFC 7230 §3.3.3; malformed framing closes the
-//! connection the same way a failed `Content-Length` read does.
+//! Also implements protocol version negotiation (IDEA.md "Core behavior" →
+//! "Protocol version negotiation"). The listener is async (`tokio`) and its
+//! message framing is `hyper`'s rather than hand-rolled:
+//!
+//! * Cleartext (`tls.enabled: false`) on `--port` serves HTTP/1.1 always,
+//!   and HTTP/2 over cleartext (h2c) by prior knowledge — `hyper_util`'s
+//!   `server::conn::auto` builder sniffs the RFC 9113 §3.4 connection
+//!   preface and switches framing accordingly. A request carrying
+//!   `Upgrade: h2c` is answered over HTTP/1.1, which RFC 9113 §3.2
+//!   explicitly permits ("A server that does not support HTTP/2 can respond
+//!   to the request as though the `Upgrade` header field were absent"); the
+//!   upgrade dance itself is not implemented, and the header never bypasses
+//!   any part of the normal request pipeline.
+//! * TLS (`tls.enabled: true`) on `--port` negotiates `h2` or `http/1.1`
+//!   via ALPN (`servers::tls`). The ALPN result — not connection sniffing —
+//!   selects the framing, so a peer cannot negotiate one version and then
+//!   speak another (an h1/h2 request-smuggling class of bug).
+//! * TLS additionally serves HTTP/3 (RFC 9114) over QUIC (RFC 9000) on a
+//!   UDP listener bound to the same port number (`servers::http3`), and
+//!   advertises it to TCP clients with `Alt-Svc: h3=":{port}"`. QUIC
+//!   mandates TLS 1.3, so there is no cleartext HTTP/3.
+//!
+//! Request bodies support `Transfer-Encoding: chunked` (RFC 9112 §7.1) in
+//! addition to `Content-Length` on HTTP/1.1, and DATA-frame framing on
+//! HTTP/2 and HTTP/3 — all three decoded by the protocol library rather
+//! than by this module, including RFC 9112 §6.1's rejection of a message
+//! carrying both framings at once. Every request reaches `handle_request`
+//! as one normalized `Request` plus a fully-buffered body regardless of the
+//! version it arrived on, so the security pipeline below is identical
+//! across all three.
 //!
 //! Script/CGI dispatch also resolves `PATH_INFO`/`PATH_TRANSLATED` per CGI
 //! 1.1 semantics: when the full literal request path does not exist,
@@ -65,20 +88,73 @@
 //! is unaffected — PATH_INFO splitting only ever applies to script routes.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+
 use crate::supports::signal;
 
 mod htaccess;
+mod http3;
 mod info;
 mod proxy;
 mod tls;
 
-use tls::Conn;
+/// The single response body type every handler in this crate produces.
+/// Boxed (rather than a concrete `Full`/`Incoming`) because a response is
+/// either a fully-buffered in-memory body (static files, error pages,
+/// directory listings, CGI output) or a streamed upstream body relayed by
+/// `servers::proxy` — one type has to cover both, and all three protocol
+/// versions consume the same one.
+pub type Body = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+/// Wraps fully-buffered bytes as a `Body`. `Full` is infallible, so the
+/// error type is mapped via an uninhabited match rather than a runtime
+/// conversion.
+pub fn full_body(bytes: impl Into<Bytes>) -> Body {
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// HTTP/2 (RFC 9113) connection limits applied to every HTTP/2 connection,
+/// cleartext or TLS. These are hardening settings, not tuning knobs:
+///
+/// * `max_concurrent_streams` bounds how many requests one connection can
+///   have in flight (SETTINGS_MAX_CONCURRENT_STREAMS, RFC 9113 §5.1.2).
+/// * `max_pending_accept_reset_streams` and `max_local_error_reset_streams`
+///   are hyper's CVE-2023-44487 ("HTTP/2 Rapid Reset") mitigations — a peer
+///   that opens and immediately `RST_STREAM`s requests in a loop otherwise
+///   costs the server unbounded work for near-zero client cost. Both are
+///   pinned explicitly rather than left to the library default so a
+///   dependency bump cannot silently loosen them.
+/// * `max_header_list_size` bounds decompressed header-block size, which is
+///   the HPACK-decompression-bomb equivalent of a request-line length cap.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 128;
+const H2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 32;
+const H2_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 32;
+const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+/// Cap on a buffered request body, applied uniformly to HTTP/1.1, HTTP/2,
+/// and HTTP/3 before the body is read into memory. Bodies are buffered (as
+/// they were before the async rewrite) so CGI/script dispatch and proxying
+/// can both see the whole payload; without a cap that buffering is an
+/// unbounded-memory denial of service on every protocol version.
+const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
+
+/// How long a peer may take to send a complete request head before the
+/// connection is dropped — a Slowloris bound, replacing the fixed 30s read
+/// timeout the previous blocking implementation set on the socket.
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Effective runtime configuration for `serve` — the fully layered result
 /// of IDEA.md's "CLI flag > env var > per-project config > global config >
@@ -323,71 +399,84 @@ pub fn run(
         logger,
     }));
 
-    while !shutdown.is_shutdown_requested() {
-        if last_reload_check.elapsed() >= Duration::from_secs(1) {
-            last_reload_check = Instant::now();
-            if reload_watch.changed() {
-                apply_reload(
-                    &cli,
-                    &runtime,
-                    &mut listener,
-                    &base_dir,
-                    quiet,
-                    &mut proxy_child,
-                    &shutdown,
-                    &stats,
-                );
+    // Everything above is startup work that must happen synchronously and
+    // in order (bind while privileged, then drop privileges, then install
+    // handlers). The async runtime is only entered once that is settled, so
+    // no listener or child process is ever created from inside a worker
+    // thread whose privileges have already been dropped mid-sequence.
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    async_runtime.block_on(async {
+        // The accept loop needs a reactor-registered listener, while
+        // `apply_reload` rebinds a plain `std` one (it is called from this
+        // same loop, but is otherwise ordinary synchronous code). The std
+        // listener stays the source of truth and the tokio listener is a
+        // registered duplicate of it, refreshed whenever a reload rebinds.
+        let mut accept = tokio::net::TcpListener::from_std(listener.try_clone()?)?;
+        let mut h3 = spawn_http3(&accept, &runtime, &base_dir, &stats);
+
+        while !shutdown.is_shutdown_requested() {
+            if last_reload_check.elapsed() >= Duration::from_secs(1) {
+                last_reload_check = Instant::now();
+                if reload_watch.changed() {
+                    let rebound = apply_reload(
+                        &cli,
+                        &runtime,
+                        &mut listener,
+                        &base_dir,
+                        quiet,
+                        &mut proxy_child,
+                        &shutdown,
+                        &stats,
+                    );
+                    if rebound {
+                        accept = tokio::net::TcpListener::from_std(listener.try_clone()?)?;
+                        if let Some(handle) = h3.take() {
+                            handle.shutdown();
+                        }
+                        h3 = spawn_http3(&accept, &runtime, &base_dir, &stats);
+                    }
+                }
+            }
+
+            // A bounded wait rather than a bare `accept().await`: the loop
+            // has to come back around regularly to notice a shutdown signal
+            // and to run the ~1s reload check even while no client connects.
+            let accepted =
+                match tokio::time::timeout(Duration::from_millis(200), accept.accept()).await {
+                    Ok(result) => result,
+                    Err(_timed_out) => continue,
+                };
+            match accepted {
+                Ok((stream, addr)) => {
+                    let ctx = ServeContext {
+                        base_dir: Arc::clone(&base_dir),
+                        state: Arc::clone(&runtime.lock().unwrap()),
+                        stats: Arc::clone(&stats),
+                    };
+                    tokio::spawn(async move {
+                        let logger = Arc::clone(&ctx.state.logger);
+                        if let Err(err) = serve_tcp_connection(stream, addr, ctx).await {
+                            logger.error(&format!("connection error from {addr}: {err}"));
+                        }
+                    });
+                }
+                Err(err) => {
+                    runtime
+                        .lock()
+                        .unwrap()
+                        .logger
+                        .error(&format!("accept error: {err}"));
+                }
             }
         }
 
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                let snapshot = Arc::clone(&runtime.lock().unwrap());
-                let base_dir = Arc::clone(&base_dir);
-                let stats = Arc::clone(&stats);
-                let opts = Arc::clone(&snapshot.opts);
-                let logger = Arc::clone(&snapshot.logger);
-                let tls_config = snapshot.tls_config.clone();
-                let proxy_target = snapshot.proxy_target.clone();
-                std::thread::spawn(move || {
-                    let conn = match tls_config {
-                        Some(config) => match rustls::ServerConnection::new(config) {
-                            Ok(session) => {
-                                Conn::Tls(Box::new(rustls::StreamOwned::new(session, stream)))
-                            }
-                            Err(err) => {
-                                logger
-                                    .error(&format!("TLS session setup failed for {addr}: {err}"));
-                                return;
-                            }
-                        },
-                        None => Conn::Plain(stream),
-                    };
-                    if let Err(err) = serve_connection(
-                        conn,
-                        &base_dir,
-                        &opts,
-                        &logger,
-                        &addr.to_string(),
-                        &stats,
-                        &proxy_target,
-                    ) {
-                        logger.error(&format!("connection error from {addr}: {err}"));
-                    }
-                });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => {
-                runtime
-                    .lock()
-                    .unwrap()
-                    .logger
-                    .error(&format!("accept error: {err}"));
-            }
+        if let Some(handle) = h3.take() {
+            handle.shutdown();
         }
-    }
+        Ok::<(), std::io::Error>(())
+    })?;
 
     // Ordinary graceful-shutdown path: kill and reap the framework
     // dev-server child directly (the signal handler above already sent it
@@ -428,22 +517,85 @@ fn bind_listener(
     opts: &ServeOptions,
     base_dir: &Path,
     on_tls_warning: impl Fn(&str),
-) -> std::io::Result<(TcpListener, Option<Arc<rustls::ServerConfig>>)> {
+) -> std::io::Result<(TcpListener, Option<Arc<tls::TlsSetup>>)> {
     let listener = TcpListener::bind(format_bind_addr(opts))?;
+    // Required before `tokio::net::TcpListener::from_std` can adopt it.
     listener.set_nonblocking(true)?;
 
     let tls_config = if opts.tls_enabled {
         let fqdn = opts.fqdn.clone().unwrap_or_default();
-        Some(tls::build_server_config(
+        Some(Arc::new(tls::build_server_config(
             &fqdn,
             &opts.listen,
             base_dir,
             on_tls_warning,
-        )?)
+        )?))
     } else {
         None
     };
     Ok((listener, tls_config))
+}
+
+/// Per-connection view of everything a request handler needs: the
+/// canonicalized document root, the current (reload-swappable) runtime
+/// snapshot, and the shared `/server-info` statistics. Cloned per accepted
+/// connection so a reload landing mid-connection cannot change the
+/// configuration a connection already in progress is being served under.
+#[derive(Clone)]
+struct ServeContext {
+    base_dir: Arc<PathBuf>,
+    state: Arc<RuntimeState>,
+    stats: Arc<info::Stats>,
+}
+
+/// Starts the HTTP/3 listener for the current runtime snapshot, or returns
+/// `None` when TLS is off (QUIC mandates TLS 1.3, so cleartext HTTP/3 does
+/// not exist). The UDP socket is bound to the TCP listener's *actual* local
+/// address, which matters when `port: 0` was requested — the two listeners
+/// must agree on a port number for the `Alt-Svc` advertisement to be true.
+fn spawn_http3(
+    accept: &tokio::net::TcpListener,
+    runtime: &Mutex<Arc<RuntimeState>>,
+    base_dir: &Arc<PathBuf>,
+    stats: &Arc<info::Stats>,
+) -> Option<http3::Handle> {
+    let state = Arc::clone(&runtime.lock().unwrap());
+    let quic = Arc::clone(&state.tls_config.as_ref()?.quic);
+    let addr = match accept.local_addr() {
+        Ok(addr) => addr,
+        Err(err) => {
+            state
+                .logger
+                .error(&format!("HTTP/3 listener not started: {err}"));
+            return None;
+        }
+    };
+    let ctx = ServeContext {
+        base_dir: Arc::clone(base_dir),
+        state: Arc::clone(&state),
+        stats: Arc::clone(stats),
+    };
+    match http3::spawn(addr, quic, ctx) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            // A failed QUIC bind is not fatal: HTTP/1.1 and HTTP/2 are still
+            // being served on TCP. It is recorded rather than swallowed so
+            // the reason shows up on the `/server-info` dashboard.
+            state
+                .logger
+                .error(&format!("HTTP/3 listener not started on {addr}: {err}"));
+            stats.record_issue(
+                info::IssueKind::TlsIssue,
+                "/",
+                &format!("HTTP/3 listener not started on {addr}: {err}"),
+                "QUIC",
+                &state.opts.fqdn.clone().unwrap_or_default(),
+                0,
+                None,
+            );
+            None
+        }
+    }
 }
 
 /// Bundles every piece of per-connection runtime configuration a live
@@ -457,7 +609,7 @@ fn bind_listener(
 /// reload existed.
 struct RuntimeState {
     opts: Arc<ServeOptions>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_config: Option<Arc<tls::TlsSetup>>,
     proxy_target: Option<Arc<proxy::ProxyTarget>>,
     logger: Arc<Logger>,
 }
@@ -554,6 +706,10 @@ fn config_needs_logger_reopen(old: &ServeOptions, new: &ServeOptions) -> bool {
 /// port after privileges were already dropped) is logged as a warning and
 /// recorded on the `/server-info` dashboard; the server keeps running on
 /// its previous configuration for that piece rather than crashing.
+///
+/// Returns whether the listener was actually rebound, so the caller knows
+/// to re-register the new socket with the async reactor and restart the
+/// HTTP/3 listener that shares its port number.
 // Each parameter is a distinct piece of the running server's live state
 // (client overrides for precedence, the swappable runtime cell, the bound
 // listener that may need rebinding, base_dir, quiet flag, the proxy child
@@ -571,7 +727,7 @@ fn apply_reload(
     proxy_child: &mut Option<std::process::Child>,
     shutdown: &signal::ShutdownState,
     stats: &info::Stats,
-) {
+) -> bool {
     let current = Arc::clone(&runtime.lock().unwrap());
 
     let mut new_opts = match crate::configs::load(cli, false) {
@@ -588,7 +744,7 @@ fn apply_reload(
                 0,
                 None,
             );
-            return;
+            return false;
         }
     };
 
@@ -718,10 +874,14 @@ fn apply_reload(
             None,
         );
     }
+    listener_rebound
 }
 
-/// A parsed HTTP/1.x request line + headers (IDEA.md "Core behavior" /
-/// AI.md PART 14 RFC 9110/9112 conformance).
+/// One request, normalized to the same shape regardless of whether it
+/// arrived as an HTTP/1.1 message (RFC 9112), an HTTP/2 HEADERS frame (RFC
+/// 9113), or an HTTP/3 HEADERS frame (RFC 9114). Header names are
+/// lowercased — mandatory on HTTP/2 and HTTP/3, and case-insensitive on
+/// HTTP/1.1 (RFC 9110 §5.1) — so every lookup below is version-agnostic.
 struct Request {
     method: String,
     path: String,
@@ -729,195 +889,419 @@ struct Request {
     headers: HashMap<String, String>,
 }
 
-fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Option<Request>> {
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(None);
-    }
-    let request_line = request_line.trim_end();
-    if request_line.is_empty() {
-        return Ok(None);
-    }
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    Ok(Some(Request {
-        method,
-        path,
-        version,
-        headers,
-    }))
-}
-
-/// Decodes a `Transfer-Encoding: chunked` request body (RFC 7230 §4.1) from
-/// `reader`: repeatedly reads a `CRLF`-terminated chunk-size line (hex,
-/// optional `;` chunk-extensions, discarded), then that many bytes of chunk
-/// data plus its trailing `CRLF`, until a `0`-size chunk is seen, after which
-/// any trailer header lines are read and discarded (no trailer-header
-/// support — never merged into `request.headers`) up to the terminating
-/// blank line. No artificial size cap (IDEA.md "Security"), matching the
-/// `Content-Length` path. Returns `Ok(None)` on any malformed chunk framing
-/// (bad hex size, missing CRLF, EOF mid-chunk) — the caller treats that the
-/// same as a `Content-Length` `read_exact` failure and closes the
-/// connection.
-fn read_chunked_body(reader: &mut BufReader<Conn>) -> std::io::Result<Option<Vec<u8>>> {
-    let mut body = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        if reader.read_line(&mut size_line)? == 0 {
-            return Ok(None);
-        }
-        let size_line = size_line.trim_end_matches(['\r', '\n']);
-        let size_str = size_line.split(';').next().unwrap_or("").trim();
-        let size = match usize::from_str_radix(size_str, 16) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
+impl Request {
+    /// Builds the normalized request from an `http::request::Parts`, the
+    /// common currency of both `hyper` (HTTP/1.1, HTTP/2) and `h3`
+    /// (HTTP/3).
+    ///
+    /// `path` deliberately carries the origin-form target *including* the
+    /// query string, exactly as the previous hand-rolled parser recorded
+    /// the request line's second token: everything downstream (`.htaccess`
+    /// rewrites, `QUERY_STRING`, logging) is written against that shape.
+    /// A request whose target has no path at all (`OPTIONS *`, or an
+    /// authority-form CONNECT) normalizes to `*`, which fails the known-
+    /// method/route checks in `handle_request` rather than being treated as
+    /// the document root.
+    ///
+    /// Repeated header fields are joined with `", "` per RFC 9110 §5.3
+    /// rather than silently dropping all but one — the CGI environment and
+    /// the proxy forwarder both need the complete field value.
+    fn from_parts(parts: &http::request::Parts) -> Self {
+        let path = match parts.uri.path_and_query() {
+            Some(pq) => pq.as_str().to_string(),
+            None => "*".to_string(),
         };
-
-        if size == 0 {
-            loop {
-                let mut trailer_line = String::new();
-                if reader.read_line(&mut trailer_line)? == 0 {
-                    return Ok(None);
-                }
-                let trailer_line = trailer_line.trim_end_matches(['\r', '\n']);
-                if trailer_line.is_empty() {
-                    break;
-                }
-            }
-            return Ok(Some(body));
+        let version = match parts.version {
+            http::Version::HTTP_10 => "HTTP/1.0",
+            http::Version::HTTP_2 => "HTTP/2.0",
+            http::Version::HTTP_3 => "HTTP/3.0",
+            _ => "HTTP/1.1",
         }
-
-        let mut chunk = vec![0u8; size];
-        if reader.read_exact(&mut chunk).is_err() {
-            return Ok(None);
+        .to_string();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for (name, value) in parts.headers.iter() {
+            // A header whose value is not valid UTF-8 is dropped rather
+            // than lossily transcoded: it would otherwise reach the CGI
+            // environment and the upstream proxy request as different bytes
+            // than the peer sent, which is exactly how header-smuggling
+            // bugs start.
+            let Ok(value) = value.to_str() else { continue };
+            headers
+                .entry(name.as_str().to_ascii_lowercase())
+                .and_modify(|existing| {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
         }
-        body.extend_from_slice(&chunk);
-
-        let mut crlf = [0u8; 2];
-        if reader.read_exact(&mut crlf).is_err() || &crlf != b"\r\n" {
-            return Ok(None);
+        Self {
+            method: parts.method.as_str().to_string(),
+            path,
+            version,
+            headers,
         }
     }
 }
 
-/// Serves every keep-alive request on one connection (RFC 9112 §9.3 —
-/// HTTP/1.1 connections are persistent unless `Connection: close` is sent).
-// The connection, base_dir, effective config, logger, client address,
-// stats, and optional proxy target are each read independently while
-// dispatching every request on this connection — this is the per-connection
-// context threaded through the accept loop, not incidental grouping.
-#[allow(clippy::too_many_arguments)]
-fn serve_connection(
-    conn: Conn,
-    base_dir: &Path,
-    opts: &ServeOptions,
-    logger: &Logger,
-    client: &str,
-    stats: &info::Stats,
-    proxy_target: &Option<Arc<proxy::ProxyTarget>>,
+/// Which framing to speak on an accepted connection. Chosen once, up front,
+/// from the TLS ALPN result (or from the absence of TLS) rather than
+/// re-derived per message — a connection that negotiated `h2` is served as
+/// HTTP/2 and nothing else, which is what keeps an h1/h2 request-smuggling
+/// confusion from being reachable at all.
+enum HttpMode {
+    /// Cleartext: HTTP/1.1, upgraded to HTTP/2 only when the peer opens
+    /// with the RFC 9113 §3.4 connection preface (prior-knowledge h2c).
+    Auto,
+    /// ALPN negotiated `http/1.1`, or the peer offered no ALPN at all.
+    Http1,
+    /// ALPN negotiated `h2`.
+    Http2,
+}
+
+/// Serves one accepted TCP connection end to end: TLS handshake (when
+/// enabled), protocol selection, then `hyper`'s connection driver.
+async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+    ctx: ServeContext,
 ) -> std::io::Result<()> {
-    conn.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(conn);
+    // Small responses (error pages, 304s, CGI output) should leave
+    // immediately rather than waiting on Nagle coalescing.
+    let _ = stream.set_nodelay(true);
+    let client = addr.to_string();
 
-    loop {
-        let request = match parse_request(&mut reader) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(()),
-            Err(_) => return Ok(()),
-        };
+    let Some(setup) = ctx.state.tls_config.clone() else {
+        return serve_http(TokioIo::new(stream), ctx, client, HttpMode::Auto).await;
+    };
 
-        let keep_alive = request
-            .headers
-            .get("connection")
-            .map(|v| !v.eq_ignore_ascii_case("close"))
-            .unwrap_or_else(|| request.version == "HTTP/1.1");
+    // The handshake is bounded by the same deadline as a request head: an
+    // idle peer that opens a socket and never sends a ClientHello must not
+    // hold a connection slot indefinitely.
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&setup.tcp));
+    let tls = tokio::time::timeout(REQUEST_HEAD_TIMEOUT, acceptor.accept(stream))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
+        })??;
+    // rustls reports the negotiated protocol, or `None` when the client sent
+    // no ALPN extension. Only the exact byte string `h2` selects HTTP/2;
+    // everything else (including `http/1.1` and no ALPN) is HTTP/1.1, per
+    // RFC 9113 §3.1.
+    let mode = if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+        HttpMode::Http2
+    } else {
+        HttpMode::Http1
+    };
+    serve_http(TokioIo::new(tls), ctx, client, mode).await
+}
 
-        // No artificial resource limits (IDEA.md "Security" — a script/CGI
-        // request body is read in full per its own `Content-Length` or
-        // `Transfer-Encoding: chunked` framing, never capped or streamed
-        // with a server-imposed ceiling).
-        let chunked = request
-            .headers
-            .get("transfer-encoding")
-            .map(|v| v.to_ascii_lowercase().contains("chunked"))
-            .unwrap_or(false);
-        let body = if chunked {
-            // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over any
-            // Content-Length present on the same message.
-            match read_chunked_body(&mut reader)? {
-                Some(b) => b,
-                None => return Ok(()),
-            }
-        } else {
-            let content_length: usize = request
-                .headers
-                .get("content-length")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 && reader.read_exact(&mut body).is_err() {
-                return Ok(());
-            }
-            body
-        };
+/// Drives one connection with `hyper`, in whichever framing `mode` selected.
+/// All three arms share exactly one service function, so no request can
+/// reach the handler pipeline through a version-specific side door.
+async fn serve_http<I>(
+    io: I,
+    ctx: ServeContext,
+    client: String,
+    mode: HttpMode,
+) -> std::io::Result<()>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req: hyper::Request<Incoming>| {
+        let ctx = ctx.clone();
+        let client = client.clone();
+        async move { serve_hyper_request(ctx, client, req).await }
+    });
 
-        let outcome = handle_request(
-            reader.get_mut(),
-            base_dir,
-            opts,
-            &request,
-            &body,
-            client,
-            keep_alive,
-            proxy_target,
-            stats,
-        );
-        let (status, bytes) = match outcome {
-            Ok(v) => v,
-            Err(err) => {
-                logger.error(&format!("{client} request error: {err}"));
-                return Ok(());
-            }
-        };
-        stats.record_totals(
-            &request.method,
-            &request.path,
-            status,
-            bytes,
-            body.len() as u64,
-        );
-        logger.access(
-            client,
-            &request.method,
-            &request.path,
-            &request.version,
-            status,
-            bytes,
-            &request.headers,
-        );
+    let result = match mode {
+        HttpMode::Auto => {
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder.http1().timer(TokioTimer::new());
+            configure_http1(&mut builder.http1());
+            builder.http2().timer(TokioTimer::new());
+            configure_http2(&mut builder.http2());
+            builder.serve_connection_with_upgrades(io, service).await
+        }
+        HttpMode::Http1 => {
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.timer(TokioTimer::new());
+            configure_http1(&mut builder);
+            builder
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+                .map_err(Into::into)
+        }
+        HttpMode::Http2 => {
+            let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+            builder.timer(TokioTimer::new());
+            configure_http2(&mut builder);
+            builder
+                .serve_connection(io, service)
+                .await
+                .map_err(Into::into)
+        }
+    };
 
-        if !keep_alive || status == 400 {
-            return Ok(());
+    // A peer disconnecting mid-response is routine, not a server fault; the
+    // error is still surfaced to the caller, which logs it to the error log
+    // exactly as the previous implementation logged connection errors.
+    result.map_err(std::io::Error::other)
+}
+
+/// Applies the HTTP/1.1 hardening and output-shape settings shared by the
+/// cleartext and ALPN-`http/1.1` paths.
+fn configure_http1<T: HeaderCasing>(builder: &mut T) {
+    // Apache-style capitalized header names on the wire. HTTP/1.1 header
+    // names are case-insensitive (RFC 9110 §5.1), but this server's whole
+    // point is drop-in familiarity with Apache output.
+    builder.set_title_case_headers(true);
+    // Slowloris bound: a peer has this long to finish sending a request
+    // head, replacing the blocking implementation's socket read timeout.
+    builder.set_header_read_timeout(REQUEST_HEAD_TIMEOUT);
+}
+
+/// Applies the HTTP/2 (RFC 9113) hardening settings shared by the
+/// prior-knowledge h2c and ALPN-`h2` paths — see the `H2_*` constants.
+fn configure_http2<T: Http2Limits>(builder: &mut T) {
+    builder.set_max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    builder.set_max_pending_accept_reset_streams(H2_MAX_PENDING_ACCEPT_RESET_STREAMS);
+    builder.set_max_local_error_reset_streams(H2_MAX_LOCAL_ERROR_RESET_STREAMS);
+    builder.set_max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
+}
+
+/// The HTTP/1.1 knobs `configure_http1` sets. `hyper`'s standalone
+/// `http1::Builder` and `hyper_util`'s `auto::Http1Builder` expose the same
+/// methods but share no trait, so this bridges them rather than duplicating
+/// the settings (and risking the two paths drifting apart).
+trait HeaderCasing {
+    fn set_title_case_headers(&mut self, enabled: bool);
+    fn set_header_read_timeout(&mut self, timeout: Duration);
+}
+
+impl HeaderCasing for hyper::server::conn::http1::Builder {
+    fn set_title_case_headers(&mut self, enabled: bool) {
+        self.title_case_headers(enabled);
+    }
+    fn set_header_read_timeout(&mut self, timeout: Duration) {
+        self.header_read_timeout(timeout);
+    }
+}
+
+impl HeaderCasing for hyper_util::server::conn::auto::Http1Builder<'_, TokioExecutor> {
+    fn set_title_case_headers(&mut self, enabled: bool) {
+        self.title_case_headers(enabled);
+    }
+    fn set_header_read_timeout(&mut self, timeout: Duration) {
+        self.header_read_timeout(timeout);
+    }
+}
+
+/// The HTTP/2 limits `configure_http2` sets, bridging `hyper`'s standalone
+/// `http2::Builder` and `hyper_util`'s `auto::Http2Builder` for the same
+/// reason `HeaderCasing` exists.
+trait Http2Limits {
+    fn set_max_concurrent_streams(&mut self, max: u32);
+    fn set_max_pending_accept_reset_streams(&mut self, max: usize);
+    fn set_max_local_error_reset_streams(&mut self, max: usize);
+    fn set_max_header_list_size(&mut self, max: u32);
+}
+
+impl Http2Limits for hyper::server::conn::http2::Builder<TokioExecutor> {
+    fn set_max_concurrent_streams(&mut self, max: u32) {
+        self.max_concurrent_streams(max);
+    }
+    fn set_max_pending_accept_reset_streams(&mut self, max: usize) {
+        self.max_pending_accept_reset_streams(max);
+    }
+    fn set_max_local_error_reset_streams(&mut self, max: usize) {
+        self.max_local_error_reset_streams(max);
+    }
+    fn set_max_header_list_size(&mut self, max: u32) {
+        self.max_header_list_size(max);
+    }
+}
+
+impl Http2Limits for hyper_util::server::conn::auto::Http2Builder<'_, TokioExecutor> {
+    fn set_max_concurrent_streams(&mut self, max: u32) {
+        self.max_concurrent_streams(max);
+    }
+    fn set_max_pending_accept_reset_streams(&mut self, max: usize) {
+        self.max_pending_accept_reset_streams(max);
+    }
+    fn set_max_local_error_reset_streams(&mut self, max: usize) {
+        self.max_local_error_reset_streams(max);
+    }
+    fn set_max_header_list_size(&mut self, max: u32) {
+        self.max_header_list_size(max);
+    }
+}
+
+/// Adapts one `hyper` request (HTTP/1.1 or HTTP/2) into the version-neutral
+/// `dispatch` pipeline: normalizes the head, buffers the body under
+/// `MAX_REQUEST_BODY`, and carries the `Upgrade` handle through for the
+/// WebSocket proxy relay.
+async fn serve_hyper_request(
+    ctx: ServeContext,
+    client: String,
+    mut req: hyper::Request<Incoming>,
+) -> std::io::Result<Response<Body>> {
+    // Must be taken before the request is decomposed — `hyper` stores the
+    // upgrade handle in the request extensions, which `into_parts` moves
+    // out of reach of the proxy relay otherwise. Taking it does not itself
+    // upgrade anything; it only becomes live if a 101 is actually returned.
+    let upgrade = hyper::upgrade::on(&mut req);
+    let (parts, incoming) = req.into_parts();
+    let request = Request::from_parts(&parts);
+
+    // A declared body larger than the cap is refused before a single byte
+    // of it is buffered.
+    let declared: Option<u64> = request
+        .headers
+        .get("content-length")
+        .and_then(|v| v.trim().parse().ok());
+    if declared.is_some_and(|len| len > MAX_REQUEST_BODY) {
+        return Ok(dispatch_status(&ctx, &request, &client, 413, 0));
+    }
+
+    let body = match http_body_util::Limited::new(incoming, MAX_REQUEST_BODY as usize)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) => {
+            // Two distinct client faults reach here and they get distinct
+            // statuses: a peer that exceeded the cap without declaring it
+            // (`LengthLimitError`) is 413, while a truncated or malformed
+            // body — including the RFC 9112 §7.1 chunk-framing errors
+            // `hyper` rejects on our behalf — is 400.
+            let status = if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                413
+            } else {
+                400
+            };
+            return Ok(dispatch_status(&ctx, &request, &client, status, 0));
+        }
+    };
+
+    Ok(dispatch(&ctx, &request, body, &client, Some(upgrade)).await)
+}
+
+/// Logs and returns a bare status response for a request that never reaches
+/// the handler pipeline (body too large, or unreadable). Kept on the same
+/// logging/stats path as a served request so a rejected request is still
+/// visible in the access log and on `/server-info`.
+fn dispatch_status(
+    ctx: &ServeContext,
+    request: &Request,
+    client: &str,
+    status: u16,
+    body_len: u64,
+) -> Response<Body> {
+    let response = respond_error(status, request, &ctx.state.opts).unwrap_or_else(|_| {
+        let mut fallback = Response::new(full_body(Bytes::new()));
+        *fallback.status_mut() =
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        fallback
+    });
+    finish_response(ctx, request, client, response, body_len)
+}
+
+/// The one entry point every protocol version funnels through: runs the
+/// request through `handle_request`, then applies the shared response
+/// post-processing (HTTP/3 advertisement, statistics, access logging).
+async fn dispatch(
+    ctx: &ServeContext,
+    request: &Request,
+    body: Bytes,
+    client: &str,
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Response<Body> {
+    let body_len = body.len() as u64;
+    let response = match handle_request(ctx, request, &body, client, upgrade).await {
+        Ok(response) => response,
+        Err(err) => {
+            // A handler-level I/O failure is the server's fault, not the
+            // peer's, and is reported as such instead of dropping the
+            // connection with no response at all (which is what the
+            // blocking implementation did).
+            ctx.state
+                .logger
+                .error(&format!("{client} request error: {err}"));
+            respond_error(500, request, &ctx.state.opts).unwrap_or_else(|_| {
+                let mut fallback = Response::new(full_body(Bytes::new()));
+                *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                fallback
+            })
+        }
+    };
+    finish_response(ctx, request, client, response, body_len)
+}
+
+/// Response post-processing shared by every protocol version: advertises
+/// HTTP/3 when it is actually running, then records the exchange in the
+/// `/server-info` statistics and the on-disk access log.
+fn finish_response(
+    ctx: &ServeContext,
+    request: &Request,
+    client: &str,
+    mut response: Response<Body>,
+    request_body_len: u64,
+) -> Response<Body> {
+    // IDEA.md "Protocol version negotiation": HTTP/3 shares the TCP
+    // listener's port number, so the advertisement is exact. It is only
+    // truthful when TLS is on (QUIC mandates TLS 1.3), and is not sent on
+    // HTTP/3 responses themselves — the peer is already there.
+    if ctx.state.opts.tls_enabled && request.version != "HTTP/3.0" {
+        if let Ok(value) = http::HeaderValue::from_str(&format!("h3=\":{}\"", ctx.state.opts.port))
+        {
+            response.headers_mut().insert(http::header::ALT_SVC, value);
         }
     }
+
+    let status = response.status().as_u16();
+    let bytes = response_bytes(&response);
+    ctx.stats.record_totals(
+        &request.method,
+        &request.path,
+        status,
+        bytes,
+        request_body_len,
+    );
+    ctx.state.logger.access(
+        client,
+        &request.method,
+        &request.path,
+        &request.version,
+        status,
+        bytes,
+        &request.headers,
+    );
+    response
+}
+
+/// Response body size for the access log and statistics. Buffered bodies
+/// report an exact size hint; a streamed proxy relay does not, so its
+/// upstream-declared `Content-Length` is used instead, and a streamed
+/// response with no declared length logs `0` (the same "unknown" marker the
+/// Apache combined format uses).
+fn response_bytes(response: &Response<Body>) -> u64 {
+    use hyper::body::Body as _;
+    response
+        .body()
+        .size_hint()
+        .exact()
+        .or_else(|| {
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// `.htaccess`/`.htpasswd` are never servable as static content, at any
@@ -992,47 +1376,38 @@ fn path_contains_symlink(base_dir: &Path, candidate: &Path) -> bool {
 /// mapping applies to any error status from any phase above"): serves the
 /// configured `ErrorDocument` target if one exists for `status`, else falls
 /// back to the embedded default error page.
-fn respond_with_error_document(
-    stream: &mut Conn,
+async fn respond_with_error_document(
     status: u16,
     request: &Request,
     opts: &ServeOptions,
-    keep_alive: bool,
     base_dir: &Path,
     rules: &htaccess::Rules,
-) -> std::io::Result<(u16, u64)> {
-    let head_only = request.method == "HEAD";
+) -> std::io::Result<Response<Body>> {
     if let Some(target) = rules.error_documents.get(&status) {
         if target.starts_with("http://") || target.starts_with("https://") {
-            return write_response(
-                stream,
+            return build_response(
                 302,
                 "Found",
-                &[],
-                true,
-                keep_alive,
+                Bytes::new(),
                 &[("Location".to_string(), target.clone())],
             );
         }
         let rel = target.trim_start_matches('/');
         if let Ok(resolved) = base_dir.join(rel).canonicalize() {
             if (resolved == base_dir || resolved.starts_with(base_dir)) && resolved.is_file() {
-                if let Ok(content) = std::fs::read(&resolved) {
+                if let Ok(content) = tokio::fs::read(&resolved).await {
                     let content_type = content_type_for(&resolved, opts);
-                    return write_response(
-                        stream,
+                    return build_response(
                         status,
                         reason_phrase(status),
-                        &content,
-                        head_only,
-                        keep_alive,
+                        Bytes::from(content),
                         &[("Content-Type".to_string(), content_type)],
                     );
                 }
             }
         }
     }
-    respond_error(stream, status, request, opts, keep_alive)
+    respond_error(status, request, opts)
 }
 
 /// Best-effort CGI 1.1 PATH_INFO/PATH_TRANSLATED resolution (CGI 1.1
@@ -1090,23 +1465,26 @@ fn resolve_script_path_info(
     None
 }
 
-// This is the top-level per-request dispatcher (static files, CGI/scripts,
-// proxying, `.htaccess` pipeline, `/server-info`) — it genuinely needs the
-// stream, base_dir, effective config, parsed request, body, client address,
-// keep-alive decision, proxy target, and stats simultaneously to route and
-// answer the request; a wrapper struct would not reduce this real fan-out.
-#[allow(clippy::too_many_arguments)]
-fn handle_request(
-    stream: &mut Conn,
-    base_dir: &Path,
-    opts: &ServeOptions,
+/// The top-level per-request dispatcher (static files, CGI/scripts,
+/// proxying, `.htaccess` pipeline, `/server-info`), shared verbatim by
+/// HTTP/1.1, HTTP/2, and HTTP/3 — every access-control decision below
+/// applies identically on all three, because all three arrive here.
+///
+/// `upgrade` is the connection's `Upgrade` handle, present only on HTTP/1.1
+/// (HTTP/2 and HTTP/3 have no `Upgrade` mechanism, RFC 9113 §8.1); it is
+/// used solely by the framework-proxy WebSocket relay.
+async fn handle_request(
+    ctx: &ServeContext,
     request: &Request,
     body: &[u8],
     client: &str,
-    keep_alive: bool,
-    proxy_target: &Option<Arc<proxy::ProxyTarget>>,
-    stats: &info::Stats,
-) -> std::io::Result<(u16, u64)> {
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> std::io::Result<Response<Body>> {
+    let base_dir: &Path = ctx.base_dir.as_path();
+    let opts: &ServeOptions = &ctx.state.opts;
+    let stats: &info::Stats = &ctx.stats;
+    let proxy_target = &ctx.state.proxy_target;
+
     let _in_flight = stats.in_flight_guard();
     let handler_started = Instant::now();
     let head_only = request.method == "HEAD";
@@ -1115,15 +1493,22 @@ fn handle_request(
         "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
     );
     if !known_method {
-        return respond_error(stream, 405, request, opts, keep_alive);
+        return respond_error(405, request, opts);
     }
 
     let raw_path = request.path.split('?').next().unwrap_or("/");
     let query = request.path.split_once('?').map(|x| x.1).unwrap_or("");
     let mut decoded = percent_decode(raw_path);
 
+    // A target that is not origin-form (`OPTIONS *`, authority-form) never
+    // names a resource in this document root, and must not be allowed to
+    // fall through to path resolution.
+    if !decoded.starts_with('/') {
+        return respond_error(400, request, opts);
+    }
+
     if is_ht_path(&decoded) {
-        return respond_error(stream, 403, request, opts, keep_alive);
+        return respond_error(403, request, opts);
     }
 
     // The `/server-info` diagnostics dashboard (IDEA.md "`/server-info`
@@ -1134,13 +1519,10 @@ fn handle_request(
     // outside `base_dir` or any `.ht*` content.
     if decoded == "/server-info" && (request.method == "GET" || request.method == "HEAD") {
         let html = info::render_dashboard(stats, opts, proxy_target.as_deref());
-        return write_response(
-            stream,
+        return build_response(
             200,
             "OK",
-            html.as_bytes(),
-            head_only,
-            keep_alive,
+            Bytes::from(html),
             &[(
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
@@ -1157,18 +1539,18 @@ fn handle_request(
     if let Some(target) = proxy_target {
         if decoded.starts_with(target.path_prefix.as_str()) {
             let _upstream = stats.upstream_guard();
-            let outcome =
-                proxy::proxy_request(stream, target, request, body, client, opts, keep_alive);
+            let outcome = proxy::proxy_request(target, request, body, client, opts, upgrade).await;
             stats.record_handler(info::HandlerType::FrameworkProxy, handler_started.elapsed());
-            if let Ok((status, _)) = &outcome {
-                if *status >= 400 {
+            if let Ok(response) = &outcome {
+                let status = response.status().as_u16();
+                if status >= 400 {
                     stats.record_issue(
                         info::IssueKind::FrameworkProxyError,
                         &decoded,
                         &format!("upstream returned status {status}"),
                         &request.method,
                         &target.upstream,
-                        *status,
+                        status,
                         request.headers.get("referer").cloned(),
                     );
                 }
@@ -1189,19 +1571,16 @@ fn handle_request(
         &request.headers,
     ) {
         htaccess::RewriteOutcome::Redirect(status, target) => {
-            return write_response(
-                stream,
+            return build_response(
                 status,
                 reason_phrase(status),
-                &[],
-                true,
-                keep_alive,
+                Bytes::new(),
                 &[("Location".to_string(), target)],
             );
         }
         htaccess::RewriteOutcome::Rewritten(new_path) => {
             if is_ht_path(&new_path) {
-                return respond_error(stream, 403, request, opts, keep_alive);
+                return respond_error(403, request, opts);
             }
             decoded = new_path;
             rules = htaccess_rules_for(base_dir, &decoded);
@@ -1225,9 +1604,7 @@ fn handle_request(
             403,
             request.headers.get("referer").cloned(),
         );
-        return respond_with_error_document(
-            stream, 403, request, opts, keep_alive, base_dir, &rules,
-        );
+        return respond_with_error_document(403, request, opts, base_dir, &rules).await;
     }
 
     // Phases 3-4: `AuthType Basic` authentication, then `Require`
@@ -1239,9 +1616,7 @@ fn handle_request(
         && rules.require_valid_user()
     {
         let Some(user_file) = rules.auth_user_file.clone() else {
-            return respond_with_error_document(
-                stream, 500, request, opts, keep_alive, base_dir, &rules,
-            );
+            return respond_with_error_document(500, request, opts, base_dir, &rules).await;
         };
         let creds = request
             .headers
@@ -1261,13 +1636,10 @@ fn handle_request(
                     .clone()
                     .unwrap_or_else(|| "Restricted".to_string());
                 let auth_body = error_page(401, request, opts.debug);
-                return write_response(
-                    stream,
+                return build_response(
                     401,
                     reason_phrase(401),
-                    auth_body.as_bytes(),
-                    head_only,
-                    keep_alive,
+                    Bytes::from(auth_body),
                     &[
                         (
                             "Content-Type".to_string(),
@@ -1298,9 +1670,7 @@ fn handle_request(
                         403,
                         request.headers.get("referer").cloned(),
                     );
-                    return respond_with_error_document(
-                        stream, 403, request, opts, keep_alive, base_dir, &rules,
-                    );
+                    return respond_with_error_document(403, request, opts, base_dir, &rules).await;
                 }
             }
         }
@@ -1324,9 +1694,7 @@ fn handle_request(
             403,
             request.headers.get("referer").cloned(),
         );
-        return respond_with_error_document(
-            stream, 403, request, opts, keep_alive, base_dir, &rules,
-        );
+        return respond_with_error_document(403, request, opts, base_dir, &rules).await;
     }
 
     let resolved = match candidate.canonicalize() {
@@ -1337,7 +1705,6 @@ fn handle_request(
             {
                 let handler = handler_type_for_route(base_dir, &script_path);
                 let outcome = dispatch_script(
-                    stream,
                     base_dir,
                     &script_path,
                     &route,
@@ -1346,11 +1713,11 @@ fn handle_request(
                     body,
                     client,
                     head_only,
-                    keep_alive,
                     stats,
                     &path_info,
                     &path_translated,
-                );
+                )
+                .await;
                 stats.record_handler(handler, handler_started.elapsed());
                 return outcome;
             }
@@ -1364,17 +1731,13 @@ fn handle_request(
                 404,
                 request.headers.get("referer").cloned(),
             );
-            return respond_with_error_document(
-                stream, 404, request, opts, keep_alive, base_dir, &rules,
-            );
+            return respond_with_error_document(404, request, opts, base_dir, &rules).await;
         }
     };
 
     if resolved.is_dir() {
         if request.method != "GET" && request.method != "HEAD" {
-            return respond_with_error_document(
-                stream, 405, request, opts, keep_alive, base_dir, &rules,
-            );
+            return respond_with_error_document(405, request, opts, base_dir, &rules).await;
         }
         let default_index = ["index.html".to_string(), "index.htm".to_string()];
         let index_list = rules.directory_index.as_deref().unwrap_or(&default_index);
@@ -1384,7 +1747,6 @@ fn handle_request(
                 if let Some(route) = classify_script(base_dir, &candidate_index, opts) {
                     let handler = handler_type_for_route(base_dir, &candidate_index);
                     let outcome = dispatch_script(
-                        stream,
                         base_dir,
                         &candidate_index,
                         &route,
@@ -1393,22 +1755,15 @@ fn handle_request(
                         body,
                         client,
                         head_only,
-                        keep_alive,
                         stats,
                         "",
                         "",
-                    );
+                    )
+                    .await;
                     stats.record_handler(handler, handler_started.elapsed());
                     return outcome;
                 }
-                let outcome = serve_file(
-                    stream,
-                    &candidate_index,
-                    request,
-                    opts,
-                    head_only,
-                    keep_alive,
-                );
+                let outcome = serve_file(&candidate_index, request, opts, head_only).await;
                 stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
                 return outcome;
             }
@@ -1416,9 +1771,7 @@ fn handle_request(
         // `Options Indexes`/`-Indexes` merges with/overrides the config-file
         // `directory_listing` setting for this subtree (IDEA.md "Options").
         if rules.indexes.unwrap_or(opts.directory_listing) {
-            let outcome = serve_directory_listing(
-                stream, base_dir, &resolved, raw_path, head_only, keep_alive,
-            );
+            let outcome = serve_directory_listing(base_dir, &resolved, raw_path, head_only).await;
             stats.record_handler(
                 info::HandlerType::DirectoryListing,
                 handler_started.elapsed(),
@@ -1426,27 +1779,23 @@ fn handle_request(
             return outcome;
         }
         stats.record_handler(info::HandlerType::HtaccessDenied, handler_started.elapsed());
-        return respond_with_error_document(
-            stream, 403, request, opts, keep_alive, base_dir, &rules,
-        );
+        return respond_with_error_document(403, request, opts, base_dir, &rules).await;
     }
 
     if let Some(route) = classify_script(base_dir, &resolved, opts) {
         let handler = handler_type_for_route(base_dir, &resolved);
         let outcome = dispatch_script(
-            stream, base_dir, &resolved, &route, request, opts, body, client, head_only,
-            keep_alive, stats, "", "",
-        );
+            base_dir, &resolved, &route, request, opts, body, client, head_only, stats, "", "",
+        )
+        .await;
         stats.record_handler(handler, handler_started.elapsed());
         return outcome;
     }
 
     if request.method != "GET" && request.method != "HEAD" {
-        return respond_with_error_document(
-            stream, 405, request, opts, keep_alive, base_dir, &rules,
-        );
+        return respond_with_error_document(405, request, opts, base_dir, &rules).await;
     }
-    let outcome = serve_file(stream, &resolved, request, opts, head_only, keep_alive);
+    let outcome = serve_file(&resolved, request, opts, head_only).await;
     stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
     outcome
 }
@@ -1603,15 +1952,13 @@ fn parse_cgi_output(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
 // indirection.
 #[allow(clippy::too_many_arguments)]
 fn respond_script_failure(
-    stream: &mut Conn,
     request: &Request,
     opts: &ServeOptions,
-    keep_alive: bool,
     detail: &str,
     stats: &info::Stats,
     decoded_path: &str,
     script_path: &Path,
-) -> std::io::Result<(u16, u64)> {
+) -> std::io::Result<Response<Body>> {
     stats.record_issue(
         info::IssueKind::ScriptFailure,
         decoded_path,
@@ -1622,14 +1969,10 @@ fn respond_script_failure(
         request.headers.get("referer").cloned(),
     );
     let body = error_page_with_trace(500, request, opts.debug, Some(detail));
-    let head_only = request.method == "HEAD";
-    write_response(
-        stream,
+    build_response(
         500,
         reason_phrase(500),
-        body.as_bytes(),
-        head_only,
-        keep_alive,
+        Bytes::from(body),
         &[(
             "Content-Type".to_string(),
             "text/html; charset=utf-8".to_string(),
@@ -1638,7 +1981,7 @@ fn respond_script_failure(
 }
 
 /// Executes a CGI/script request end-to-end (IDEA.md "Multi-language script
-/// execution" → "CGI 1.1 protocol semantics"): resolves the program to run
+/// execution" -> "CGI 1.1 protocol semantics"): resolves the program to run
 /// (per `route`), builds the full CGI 1.1 environment — including
 /// `PATH_INFO`/`PATH_TRANSLATED` (CGI 1.1 §4.1.5/§4.1.6), threaded through
 /// from `handle_request`'s ancestor-prefix script resolution and empty for
@@ -1648,14 +1991,13 @@ fn respond_script_failure(
 /// HTTP response. No execution timeout — "No artificial resource limits"
 /// (IDEA.md "Security").
 // CGI/multi-language script dispatch (IDEA.md "CGI 1.1 / multi-language
-// scripting") needs the stream, base_dir, the resolved script path, the
-// matched route's interpreter config, the parsed request, effective
-// server config, body, client address, and whether it's a HEAD request all
-// at once to build the correct CGI environment and stream the response —
-// these are the CGI-spec-mandated inputs, not accumulated incidental state.
+// scripting") needs base_dir, the resolved script path, the matched route's
+// interpreter config, the parsed request, effective server config, body,
+// client address, and whether it's a HEAD request all at once to build the
+// correct CGI environment and response — these are the CGI-spec-mandated
+// inputs, not accumulated incidental state.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_script(
-    stream: &mut Conn,
+async fn dispatch_script(
     base_dir: &Path,
     script_path: &Path,
     route: &ScriptRoute,
@@ -1664,12 +2006,13 @@ fn dispatch_script(
     body: &[u8],
     client: &str,
     head_only: bool,
-    keep_alive: bool,
     stats: &info::Stats,
     path_info: &str,
     path_translated: &str,
-) -> std::io::Result<(u16, u64)> {
-    use std::process::{Command, Stdio};
+) -> std::io::Result<Response<Body>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
 
     let decoded_path = percent_decode(request.path.split('?').next().unwrap_or("/"));
 
@@ -1677,10 +2020,8 @@ fn dispatch_script(
         ScriptRoute::ExecDirect => {
             if !is_executable_file(script_path) {
                 return respond_script_failure(
-                    stream,
                     request,
                     opts,
-                    keep_alive,
                     &format!(
                         "{} is not marked executable (cgi-bin/exec-directly scripts require \
                          their own executable bit and shebang/native binary)",
@@ -1699,10 +2040,8 @@ fn dispatch_script(
                 Some(b) => b,
                 None => {
                     return respond_script_failure(
-                        stream,
                         request,
                         opts,
-                        keep_alive,
                         "script_handlers entry resolved to an empty command",
                         stats,
                         &decoded_path,
@@ -1724,13 +2063,10 @@ fn dispatch_script(
                         503,
                         request.headers.get("referer").cloned(),
                     );
-                    return write_response(
-                        stream,
+                    return build_response(
                         503,
                         "Service Unavailable",
-                        msg.as_bytes(),
-                        head_only,
-                        keep_alive,
+                        Bytes::from(msg),
                         &[(
                             "Content-Type".to_string(),
                             "text/plain; charset=utf-8".to_string(),
@@ -1805,15 +2141,19 @@ fn dispatch_script(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // The child must not inherit this process's signal disposition surprises
+    // or outlive the response: `kill_on_drop` guarantees the subprocess is
+    // reaped if this task is cancelled (client disconnect on an HTTP/2 or
+    // HTTP/3 stream reset), which the previous blocking implementation could
+    // not express.
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
             return respond_script_failure(
-                stream,
                 request,
                 opts,
-                keep_alive,
                 &format!("failed to start {}: {err}", program.display()),
                 stats,
                 &decoded_path,
@@ -1822,22 +2162,26 @@ fn dispatch_script(
         }
     };
 
+    // Feeding stdin from a separate task while `wait_with_output` concurrently
+    // drains stdout/stderr is what removes the deadlock the synchronous
+    // implementation had: a request body larger than the pipe buffer used to
+    // block the server in `write_all` while the script blocked writing a
+    // response nothing was reading.
     if let Some(mut stdin) = child.stdin.take() {
-        if !body.is_empty() {
-            let _ = stdin.write_all(body);
-        }
-        drop(stdin);
+        let payload = body.to_vec();
+        tokio::spawn(async move {
+            if !payload.is_empty() {
+                let _ = stdin.write_all(&payload).await;
+            }
+            let _ = stdin.shutdown().await;
+        });
     }
 
-    let mut stdout_buf = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout_buf);
-    }
-    let mut stderr_buf = Vec::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_end(&mut stderr_buf);
-    }
-    let wait_result = child.wait();
+    let output = child.wait_with_output().await;
+    let (stdout_buf, stderr_buf, wait_result) = match output {
+        Ok(out) => (out.stdout, out.stderr, Ok(out.status)),
+        Err(err) => (Vec::new(), Vec::new(), Err(err)),
+    };
 
     if stdout_buf.is_empty() {
         let detail = match wait_result {
@@ -1849,16 +2193,7 @@ fn dispatch_script(
             Err(err) => format!("failed to wait on {}: {err}", program.display()),
             Ok(_) => String::from_utf8_lossy(&stderr_buf).to_string(),
         };
-        return respond_script_failure(
-            stream,
-            request,
-            opts,
-            keep_alive,
-            &detail,
-            stats,
-            &decoded_path,
-            script_path,
-        );
+        return respond_script_failure(request, opts, &detail, stats, &decoded_path, script_path);
     }
 
     let (headers, cgi_body) = parse_cgi_output(&stdout_buf);
@@ -1892,15 +2227,22 @@ fn dispatch_script(
         ));
     }
 
-    write_response(
-        stream,
-        resp_status,
-        &resp_reason,
-        cgi_body,
-        head_only,
-        keep_alive,
-        &extra,
-    )
+    // A HEAD response keeps the script's own `Content-Length` semantics: the
+    // body is dropped but the length header still describes what a GET would
+    // have returned (RFC 9110 §9.3.2).
+    let payload = if head_only {
+        if !extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        {
+            extra.push(("Content-Length".to_string(), cgi_body.len().to_string()));
+        }
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(cgi_body)
+    };
+
+    build_response(resp_status, &resp_reason, payload, &extra)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -2024,17 +2366,15 @@ fn content_type_for(path: &Path, opts: &ServeOptions) -> String {
 // to pick the right status/headers/body per RFC 7232/7233 — each is used
 // independently in that decision.
 #[allow(clippy::too_many_arguments)]
-fn serve_file(
-    stream: &mut Conn,
+async fn serve_file(
     path: &Path,
     request: &Request,
     opts: &ServeOptions,
     head_only: bool,
-    keep_alive: bool,
-) -> std::io::Result<(u16, u64)> {
-    let metadata = match std::fs::metadata(path) {
+) -> std::io::Result<Response<Body>> {
+    let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return respond_error(stream, 404, request, opts, keep_alive),
+        Err(_) => return respond_error(404, request, opts),
     };
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let len = metadata.len();
@@ -2043,11 +2383,11 @@ fn serve_file(
 
     if let Some(inm) = request.headers.get("if-none-match") {
         if inm == &etag {
-            return write_response(stream, 304, "Not Modified", &[], true, keep_alive, &[]);
+            return build_response(304, "Not Modified", Bytes::new(), &[]);
         }
     } else if let Some(ims) = request.headers.get("if-modified-since") {
         if ims == &last_modified {
-            return write_response(stream, 304, "Not Modified", &[], true, keep_alive, &[]);
+            return build_response(304, "Not Modified", Bytes::new(), &[]);
         }
     }
 
@@ -2061,53 +2401,56 @@ fn serve_file(
 
     if let Some(range) = request.headers.get("range") {
         if let Some((start, end)) = parse_range(range, len) {
-            let mut file = std::fs::File::open(path)?;
-            file.seek_to(start)?;
             let take = (end - start + 1) as usize;
-            let mut buf = vec![0u8; take];
-            file.read_exact(&mut buf)?;
             let mut range_headers = extra;
             range_headers.push((
                 "Content-Range".to_string(),
                 format!("bytes {start}-{end}/{len}"),
             ));
-            return write_response(
-                stream,
-                206,
-                "Partial Content",
-                &buf,
-                head_only,
-                keep_alive,
-                &range_headers,
-            );
+            // A HEAD on a range request still reports the selected range's
+            // length without reading it (RFC 9110 §9.3.2).
+            if head_only {
+                range_headers.push(("Content-Length".to_string(), take.to_string()));
+                return build_response(206, "Partial Content", Bytes::new(), &range_headers);
+            }
+            let mut file = tokio::fs::File::open(path).await?;
+            file.seek_to(start).await?;
+            let mut buf = vec![0u8; take];
+            {
+                use tokio::io::AsyncReadExt;
+                file.read_exact(&mut buf).await?;
+            }
+            return build_response(206, "Partial Content", Bytes::from(buf), &range_headers);
         }
-        return write_response(
-            stream,
+        return build_response(
             416,
             "Range Not Satisfiable",
-            &[],
-            true,
-            keep_alive,
+            Bytes::new(),
             &[("Content-Range".to_string(), format!("bytes */{len}"))],
         );
     }
 
-    let body = if head_only {
-        Vec::new()
-    } else {
-        std::fs::read(path)?
-    };
-    write_response(stream, 200, "OK", &body, head_only, keep_alive, &extra)
+    // HEAD never reads the file: the declared `Content-Length` is taken from
+    // the metadata already loaded above, so a HEAD on a multi-gigabyte file
+    // costs one `stat` (RFC 9110 §9.3.2).
+    if head_only {
+        let mut head_headers = extra;
+        head_headers.push(("Content-Length".to_string(), len.to_string()));
+        return build_response(200, "OK", Bytes::new(), &head_headers);
+    }
+    let body = tokio::fs::read(path).await?;
+    build_response(200, "OK", Bytes::from(body), &extra)
 }
 
 trait SeekExt {
-    fn seek_to(&mut self, pos: u64) -> std::io::Result<()>;
+    async fn seek_to(&mut self, pos: u64) -> std::io::Result<()>;
 }
 
-impl SeekExt for std::fs::File {
-    fn seek_to(&mut self, pos: u64) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.seek(SeekFrom::Start(pos))?;
+impl SeekExt for tokio::fs::File {
+    async fn seek_to(&mut self, pos: u64) -> std::io::Result<()> {
+        use std::io::SeekFrom;
+        use tokio::io::AsyncSeekExt;
+        self.seek(SeekFrom::Start(pos)).await?;
         Ok(())
     }
 }
@@ -2138,14 +2481,12 @@ fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
     Some((start, end.min(len.saturating_sub(1))))
 }
 
-fn serve_directory_listing(
-    stream: &mut Conn,
+async fn serve_directory_listing(
     base_dir: &Path,
     dir: &Path,
     raw_path: &str,
     head_only: bool,
-    keep_alive: bool,
-) -> std::io::Result<(u16, u64)> {
+) -> std::io::Result<Response<Body>> {
     let mut entries: Vec<(String, Option<u64>)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -2193,18 +2534,26 @@ fn serve_directory_listing(
          <body><h1>Index of {p}</h1><ul>{rows}</ul></body></html>",
         p = html_escape(&display_path)
     );
-    write_response(
-        stream,
-        200,
-        "OK",
-        body.as_bytes(),
-        head_only,
-        keep_alive,
-        &[(
+    let headers = if head_only {
+        vec![
+            (
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ),
+            ("Content-Length".to_string(), body.len().to_string()),
+        ]
+    } else {
+        vec![(
             "Content-Type".to_string(),
             "text/html; charset=utf-8".to_string(),
-        )],
-    )
+        )]
+    };
+    let payload = if head_only {
+        Bytes::new()
+    } else {
+        Bytes::from(body)
+    };
+    build_response(200, "OK", payload, &headers)
 }
 
 fn html_escape(s: &str) -> String {
@@ -2220,6 +2569,7 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Content Too Large",
         416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -2276,53 +2626,69 @@ fn error_page_with_trace(
     )
 }
 
+/// Builds the canonical error response for `status`, using the embedded
+/// error page. A HEAD request keeps the length header a GET would have
+/// produced but carries no body (RFC 9110 §9.3.2).
 fn respond_error(
-    stream: &mut Conn,
     status: u16,
     request: &Request,
     opts: &ServeOptions,
-    keep_alive: bool,
-) -> std::io::Result<(u16, u64)> {
+) -> std::io::Result<Response<Body>> {
     let body = error_page(status, request, opts.debug);
-    let head_only = request.method == "HEAD";
-    write_response(
-        stream,
-        status,
-        reason_phrase(status),
-        body.as_bytes(),
-        head_only,
-        keep_alive,
-        &[(
-            "Content-Type".to_string(),
-            "text/html; charset=utf-8".to_string(),
-        )],
-    )
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    )];
+    if request.method == "HEAD" {
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+        return build_response(status, reason_phrase(status), Bytes::new(), &headers);
+    }
+    build_response(status, reason_phrase(status), Bytes::from(body), &headers)
 }
 
-fn write_response(
-    stream: &mut Conn,
+/// Assembles a `hyper` response from a status line, body, and the handler's
+/// extra headers. Version-specific framing (chunked/`Content-Length` for
+/// HTTP/1.1, HPACK for HTTP/2, QPACK for HTTP/3) is `hyper`'s/`h3`'s job —
+/// this only produces the abstract message, which is what keeps one handler
+/// pipeline serving all three protocol versions. Header names and values
+/// that cannot be represented on the wire are rejected here rather than
+/// silently forwarded, so a CGI script cannot inject a response header
+/// (`Status: 200\r\nSet-Cookie: ...`-style splitting) — `http`'s parsers
+/// refuse CR/LF and other illegal octets outright.
+fn build_response(
     status: u16,
     reason: &str,
-    body: &[u8],
-    head_only: bool,
-    keep_alive: bool,
+    body: Bytes,
     extra_headers: &[(String, String)],
-) -> std::io::Result<(u16, u64)> {
-    let mut header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: {}\r\n",
-        body.len(),
-        if keep_alive { "keep-alive" } else { "close" }
-    );
-    for (k, v) in extra_headers {
-        header.push_str(&format!("{k}: {v}\r\n"));
+) -> std::io::Result<Response<Body>> {
+    let code = StatusCode::from_u16(status)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let mut builder = Response::builder().status(code);
+    // A custom reason phrase only exists on HTTP/1.1; `hyper` drops the
+    // extension for HTTP/2 and HTTP/3, which have no reason phrase at all
+    // (RFC 9113 §8.3.2). Only attach it when it differs from the canonical
+    // phrase, so ordinary responses stay byte-identical to before.
+    if reason != code.canonical_reason().unwrap_or("") {
+        if let Ok(phrase) = hyper::ext::ReasonPhrase::try_from(reason.as_bytes().to_vec()) {
+            if let Some(ext) = builder.extensions_mut() {
+                ext.insert(phrase);
+            }
+        }
     }
-    header.push_str("\r\n");
-    stream.write_all(header.as_bytes())?;
-    if !head_only {
-        stream.write_all(body)?;
+    if let Some(headers) = builder.headers_mut() {
+        for (k, v) in extra_headers {
+            let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = http::HeaderValue::from_str(v) else {
+                continue;
+            };
+            headers.append(name, value);
+        }
     }
-    stream.flush()?;
-    Ok((status, body.len() as u64))
+    builder
+        .body(full_body(body))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 /// One log stream (access or error): its open file handle, path, and
@@ -2511,6 +2877,7 @@ impl Logger {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Read;
     use std::net::TcpStream;
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -2583,40 +2950,56 @@ mod tests {
         assert!(o.base_dir.is_none());
     }
 
-    fn loopback_pair() -> (Conn, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        (Conn::Plain(server), client)
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    fn test_context(opts: ServeOptions) -> ServeContext {
+        let base_dir = opts.base_dir.clone();
+        ServeContext {
+            base_dir: Arc::new(base_dir),
+            state: Arc::new(RuntimeState {
+                opts: Arc::new(opts),
+                tls_config: None,
+                proxy_target: None,
+                logger: Arc::new(Logger::open(&std::env::temp_dir(), "test", true)),
+            }),
+            stats: Arc::new(info::Stats::new("test")),
+        }
     }
 
     fn request_over_loopback(base_dir: &Path, request_line: &str) -> String {
         request_over_loopback_opts(test_opts(base_dir.to_path_buf()), request_line)
     }
 
+    /// Drives one real cleartext connection end to end through the same
+    /// `serve_tcp_connection` the accept loop uses, so these tests exercise
+    /// `hyper`'s actual HTTP/1.1 framing rather than a stand-in.
     fn request_over_loopback_opts(opts: ServeOptions, request_line: &str) -> String {
+        request_over_loopback_bytes(opts, request_line.as_bytes(), b"Connection: close\r\n\r\n")
+    }
+
+    fn request_over_loopback_bytes(opts: ServeOptions, head: &[u8], tail: &[u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let base_dir = opts.base_dir.clone();
-        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let stats = Arc::new(info::Stats::new("test"));
+        let ctx = test_context(opts);
         let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            serve_connection(
-                Conn::Plain(stream),
-                &base_dir,
-                &opts,
-                &logger,
-                "127.0.0.1:1",
-                &stats,
-                &None,
-            )
-            .unwrap();
+            let (stream, peer) = listener.accept().unwrap();
+            // `accept()` hands back a blocking socket even from a
+            // non-blocking listener; tokio refuses to adopt one.
+            stream.set_nonblocking(true).unwrap();
+            block_on(async move {
+                let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+                serve_tcp_connection(stream, peer, ctx).await.unwrap();
+            });
         });
         let mut client = TcpStream::connect(addr).unwrap();
-        client.write_all(request_line.as_bytes()).unwrap();
-        client.write_all(b"Connection: close\r\n\r\n").unwrap();
+        client.write_all(head).unwrap();
+        client.write_all(tail).unwrap();
         let mut buf = Vec::new();
         client.read_to_end(&mut buf).unwrap();
         handle.join().unwrap();
@@ -2624,38 +3007,42 @@ mod tests {
     }
 
     #[test]
-    fn write_response_full_body_includes_headers_and_content() {
-        let (mut server, mut client) = loopback_pair();
-        write_response(&mut server, 200, "OK", b"hello", false, false, &[]).unwrap();
-        drop(server);
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
-        let text = String::from_utf8_lossy(&buf);
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("Content-Length: 5\r\n"));
-        assert!(text.contains("Connection: close\r\n"));
-        assert!(text.ends_with("hello"));
+    fn build_response_full_body_includes_headers_and_content() {
+        let response = build_response(200, "OK", Bytes::from_static(b"hello"), &[]).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let collected = block_on(response.into_body().collect()).unwrap().to_bytes();
+        assert_eq!(collected.as_ref(), b"hello");
     }
 
     #[test]
-    fn write_response_head_only_omits_body() {
-        let (mut server, mut client) = loopback_pair();
-        write_response(
-            &mut server,
-            404,
-            "Not Found",
-            b"Not Found",
-            true,
-            false,
-            &[],
+    fn build_response_rejects_header_injection_from_script_output() {
+        let response = build_response(
+            200,
+            "OK",
+            Bytes::new(),
+            &[(
+                "X-Bad".to_string(),
+                "value\r\nSet-Cookie: injected=1".to_string(),
+            )],
         )
         .unwrap();
-        drop(server);
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
-        let text = String::from_utf8_lossy(&buf);
-        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
-        assert!(text.ends_with("\r\n\r\n"));
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(!response.headers().contains_key("x-bad"));
+    }
+
+    #[test]
+    fn head_request_omits_body_but_keeps_length() {
+        let dir = unique_dir("head-only");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hello.txt"), b"hi there").unwrap();
+        let base_dir = dir.canonicalize().unwrap();
+
+        let response = request_over_loopback(&base_dir, "HEAD /hello.txt HTTP/1.1\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Length: 8\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2667,7 +3054,10 @@ mod tests {
 
         let response = request_over_loopback(&base_dir, "GET /hello.txt HTTP/1.1\r\n");
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response.contains("ETag:"));
+        // hyper title-cases outgoing HTTP/1.1 header names token by token, so
+        // the entity tag goes out as `Etag:`. Header names are
+        // case-insensitive (RFC 9110 §5.1), so the assertion is too.
+        assert!(response.to_ascii_lowercase().contains("\netag:"));
         assert!(response.contains("Content-Type: text/plain"));
         assert!(response.ends_with("hi there"));
 
@@ -2831,7 +3221,7 @@ mod tests {
         let first = request_over_loopback(&base_dir, "GET /data.txt HTTP/1.1\r\n");
         let etag = first
             .lines()
-            .find(|l| l.starts_with("ETag:"))
+            .find(|l| l.to_ascii_lowercase().starts_with("etag:"))
             .and_then(|l| l.split_once(':'))
             .map(|(_, v)| v.trim().to_string())
             .unwrap();
@@ -3041,30 +3431,7 @@ mod tests {
             "POST /echo.py HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let stats = Arc::new(info::Stats::new("test"));
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            serve_connection(
-                Conn::Plain(stream),
-                &base_dir,
-                &opts,
-                &logger,
-                "127.0.0.1:1",
-                &stats,
-                &None,
-            )
-            .unwrap();
-        });
-        let mut client = TcpStream::connect(addr).unwrap();
-        client.write_all(request_line.as_bytes()).unwrap();
-        client.write_all(payload).unwrap();
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
-        handle.join().unwrap();
-        let response = String::from_utf8_lossy(&buf).to_string();
+        let response = request_over_loopback_bytes(opts, request_line.as_bytes(), payload);
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with("got:ping"));
@@ -3118,30 +3485,7 @@ mod tests {
             "POST /echo.py HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
         // Body "pingpongfin" split across three chunks.
         let chunked_body = b"4\r\nping\r\n4\r\npong\r\n3\r\nfin\r\n0\r\n\r\n";
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let stats = Arc::new(info::Stats::new("test"));
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            serve_connection(
-                Conn::Plain(stream),
-                &base_dir,
-                &opts,
-                &logger,
-                "127.0.0.1:1",
-                &stats,
-                &None,
-            )
-            .unwrap();
-        });
-        let mut client = TcpStream::connect(addr).unwrap();
-        client.write_all(request_line.as_bytes()).unwrap();
-        client.write_all(chunked_body).unwrap();
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
-        handle.join().unwrap();
-        let response = String::from_utf8_lossy(&buf).to_string();
+        let response = request_over_loopback_bytes(opts, request_line.as_bytes(), chunked_body);
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with("got:pingpongfin"));
@@ -3149,43 +3493,26 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Malformed chunk framing is rejected as a client error rather than
+    /// being partially decoded — `hyper` fails the body stream, and the
+    /// request never reaches a handler.
     #[test]
-    fn malformed_chunked_body_closes_connection_cleanly() {
+    fn malformed_chunked_body_is_rejected_as_bad_request() {
         let dir = unique_dir("chunked-malformed");
         fs::create_dir_all(&dir).unwrap();
         let base_dir = dir.canonicalize().unwrap();
 
         let request_line =
             "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
         let opts = test_opts(base_dir.clone());
-        let logger = Arc::new(Logger::open(&std::env::temp_dir(), "test", true));
-        let stats = Arc::new(info::Stats::new("test"));
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            // Malformed framing must not panic; the helper closes the
-            // connection cleanly (same as a failed Content-Length read).
-            serve_connection(
-                Conn::Plain(stream),
-                &base_dir,
-                &opts,
-                &logger,
-                "127.0.0.1:1",
-                &stats,
-                &None,
-            )
-            .unwrap();
-        });
-        let mut client = TcpStream::connect(addr).unwrap();
-        client.write_all(request_line.as_bytes()).unwrap();
         // "zz" is not valid hex, so the chunk-size line is malformed.
-        client.write_all(b"zz\r\nbogus\r\n0\r\n\r\n").unwrap();
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).unwrap();
-        handle.join().unwrap();
+        let response =
+            request_over_loopback_bytes(opts, request_line.as_bytes(), b"zz\r\nbogus\r\n0\r\n\r\n");
 
-        assert!(buf.is_empty());
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 400 "),
+            "unexpected response: {response:?}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

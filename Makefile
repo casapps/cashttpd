@@ -8,9 +8,22 @@ RUSTUP_CACHE  ?= $(HOME)/.rustup
 SCCACHE_CACHE ?= $(HOME)/.cache/sccache
 CARGO_TARGET  ?= $(HOME)/.cache/cargo-target/$(PROJECT_NAME)
 
+# Every cargo invocation names the musl target explicitly rather than relying
+# on the toolchain image's default host target. `.cargo/config.toml` applies
+# `-C target-feature=+crt-static` to the musl targets, and when the requested
+# target *is* the host target cargo also applies those rustflags to host build
+# artifacts — which makes proc-macro crates (`tokio-macros`, `futures-macro`,
+# `thiserror-impl`, and the rest of the async stack's build-time dependencies)
+# unbuildable, since a statically linked CRT cannot produce the dynamic
+# library a proc-macro is. Naming the target explicitly keeps `+crt-static` on
+# the shipped binary (PART 0 "Single Static Binary") while letting host-side
+# proc-macros build normally.
+CARGO_TARGET_TRIPLE ?= $(shell uname -m)-unknown-linux-musl
+
 RUN           := docker run --rm \
 	--name "$(PROJECT_NAME)-$$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
 	-v $(PWD):/work -w /work \
+	-e CARGO_BUILD_TARGET=$(CARGO_TARGET_TRIPLE) \
 	-v $(CARGO_CACHE):/root/.cargo \
 	-v $(RUSTUP_CACHE):/root/.rustup \
 	-v $(SCCACHE_CACHE):/root/.cache/sccache \
