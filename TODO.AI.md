@@ -319,6 +319,52 @@ scan-range step + `--results=verified,unknown`) were cross-checked and
 ported into `.github/`, `.gitea/`, and `.forgejo/` `ci.yml`/`release.yml`
 where applicable.
 
+## [ ] Implement newly-spec'd builtin features: compression, SSI, security headers, ACME HTTP-01
+Read: IDEA.md "Response compression", "Server-Side Includes (SSI)", "Default security headers",
+"TLS certificate resolution" step 2 (`.well-known/acme-challenge` responder)
+Added to IDEA.md at the user's direction after reviewing real Apache/nginx module
+configs (`/etc/httpd/conf.modules.d/**`, `/etc/httpd/conf.d/**`, `/etc/nginx/global.d/**`) to
+determine which httpd/nginx module-equivalent features cashttpd should treat as always-builtin
+(no module system, ever — see "Constraints / non-negotiables"). Four gaps were confirmed in
+scope and written into IDEA.md, not yet implemented in `src/`:
+- **Response compression**: `Accept-Encoding`-negotiated `br`/`gzip`, compressible-MIME-only,
+  `Content-Encoding`/`Vary` headers, mutually exclusive with `Range` responses.
+- **SSI**: `.shtml` (config-extendable via `ssi_extensions`) — `#include`/`#echo`/`#set`/
+  `#if`-family directives; `#exec` intentionally unsupported (security decision, matches Apache's
+  `IncludesNOEXEC` default).
+- **Default security headers**: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+  and conditional `Strict-Transport-Security` (TLS-only) on by default; overridable/removable via
+  the new `security_headers` config key; CSP/`X-XSS-Protection` deliberately excluded from the
+  built-in set (see IDEA.md for rationale).
+- **ACME HTTP-01 responder**: temporary port-80 plain-HTTP listener serving
+  `/.well-known/acme-challenge/{token}` only for the duration of a Let's Encrypt cert request
+  (step 2 of "TLS certificate resolution"), closed immediately after; falls through to the
+  self-signed fallback (step 3) if the port-80 bind fails.
+
+Explicitly out of scope (reviewed and rejected as not being httpd/nginx "modules" — see the
+IDEA.md sections above for the full reasoning): GeoIP/MaxMindDB, munin/mrtg/webalizer/awstats/
+vnstat/sysinfo-style admin apps, `/health`+`/healthz` JSON endpoints, `/tor/hostname`-style
+aliases, `UserDir`/`~user` public_html, content-negotiation type-maps/`LanguagePriority`, and
+FastCGI process-pool PHP (cashttpd's per-request `php-cgi` `script_handlers` dispatch is an
+intentional, already-implemented design choice, not a gap).
+
+## [ ] Implement newly-spec'd response-header defaults: Server, Cache-Control policy, CORS
+Read: IDEA.md "Default security headers" ("`Server` header (`server_tokens`)", "`Cache-Control`/
+`Expires` (no default)", "CORS (`cors`)" subsections)
+Three more candidate gaps found in the same `/etc/httpd/conf/httpd.conf` / `/etc/nginx/nginx.conf`
+research pass, confirmed in scope via `AskUserQuestion` and written into IDEA.md, not yet
+implemented in `src/`:
+- **`server_tokens`**: `Server` response header verbosity mirrors Apache's `ServerTokens` option
+  set exactly (`Full`/`OS`/`Minor`/`Major`/`Min`/`Prod`); defaults to `Full`
+  (`Server: cashttpd/{version} ({os}; {arch})`), matching Apache's own out-of-the-box default.
+- **No default `Cache-Control`/`Expires`**: deliberately *not* added by default (unlike a
+  production `mod_expires` setup) — stale caching fights the edit-and-reload dev workflow; a
+  project sets it explicitly via the existing `security_headers` override mechanism if wanted.
+- **`cors`**: permissive default (`Access-Control-Allow-Origin: *` plus preflight
+  method/header echo), matching typical framework dev-server behavior; new `cors` config key
+  (map override, or `false` to disable) — `Access-Control-Allow-Credentials` never defaults to
+  `true` (invalid combined with a wildcard origin per the Fetch spec).
+
 ## [ ] `Upgrade: h2c` handshake (RFC 9113 §3.2) is not implemented
 Read: IDEA.md "Core behavior" → "Protocol version negotiation"; AI.md PART 9
 Cleartext HTTP/2 is supported today only in its prior-knowledge form (RFC 9113 §3.4) — a client

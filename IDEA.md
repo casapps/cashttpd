@@ -148,7 +148,22 @@ order, first match wins:
    there is readable and currently valid (not expired, not before its not-before date), use it.
 2. **Request a new Let's Encrypt cert**: if step 1 finds nothing usable, and the effective
    `--listen` address is a valid public (routable, non-loopback, non-private) address, attempt to
-   obtain a certificate from Let's Encrypt for `{fqdn}`.
+   obtain a certificate from Let's Encrypt for `{fqdn}` via the ACME HTTP-01 challenge. This is
+   builtin — no module, no separate tool/dependency the user has to install or configure.
+   - The HTTP-01 challenge is validated by Let's Encrypt over plain HTTP on the standard port 80,
+     regardless of what `--port`/`--listen` are configured to — this is a constraint of the ACME
+     protocol itself (Let's Encrypt's validators only ever check port 80 for HTTP-01), not a choice
+     this project makes. The server binds a **temporary** plain-HTTP listener on port 80 solely to
+     serve `/.well-known/acme-challenge/{token}` for the duration of this one request, then closes
+     it — this is a narrow, one-shot bootstrapping step, not a standing second listener, so it does
+     not conflict with "Serves either plain HTTP or HTTPS on `--port`... never both" (see "Core
+     behavior"), which governs the steady-state server, not certificate acquisition.
+   - Binding port 80 requires elevated privileges on most platforms; if that bind fails (permission
+     denied, port already in use), this step is treated the same as any other failure of step 2 —
+     it falls through to step 3, it never fails startup outright.
+   - Requests to `/.well-known/acme-challenge/**` at any other time (no cert request in flight) are
+     handled as ordinary requests against `base_dir` — this project does not reserve the whole
+     `/.well-known/` namespace, only the challenge path while a request is actually in progress.
 3. **Self-signed fallback**: if neither of the above produces a usable certificate (listen address
    isn't public, or the Let's Encrypt request fails), generate a self-signed certificate for
    `{fqdn}` valid for 10 years.
@@ -201,6 +216,10 @@ has no single `base_dir` since it applies across every project.
 | `directory_listing` | bool | `false` | Enables auto-generated directory listings when no index file is found; see "Default index and directory listing". |
 | `mime_types` | map\<extension, content-type\> | `{}` | Overrides the built-in `Content-Type` for specific extensions only — not a way to add new extensions; see "MIME types". |
 | `script_handlers` | map\<extension, interpreter command\> | built-in table (php-cgi/python3/perl/lua/ruby) | Merges with the built-in extension → interpreter table: overrides a built-in extension, adds a new one, or (empty/`null` value) disables a built-in one; see "Multi-language script execution". |
+| `ssi_extensions` | list\<extension\> | `[".shtml"]` | Extensions that get Server-Side Includes processing; empty list disables SSI entirely; see "Server-Side Includes (SSI)". |
+| `security_headers` | map\<header name, value\> | built-in defaults (see "Default security headers") | Overrides/adds/removes (empty/`null` value) a default security response header; see "Default security headers". |
+| `server_tokens` | enum: `Full` \| `OS` \| `Minor` \| `Major` \| `Min` \| `Prod` | `Full` | Controls the `Server` response header's verbosity, matching Apache's `ServerTokens` option set; see "Default security headers". |
+| `cors` | map\<header name, value\> \| `false` | permissive default (see "Default security headers") | Overrides/replaces the default CORS response headers, or `false` to disable CORS headers entirely; see "Default security headers". |
 | `proxy.enabled` | bool | auto-detected | Explicitly enable/disable framework proxying; see "Framework dev-server proxying". |
 | `proxy.type` | string | auto-detected | Built-in framework profile to use (`node`, `bun`, `deno`, `rails`, `django`, `vite`, etc.). |
 | `proxy.command` | string | profile default | Custom command to start the framework dev server, overriding the profile default. |
@@ -234,6 +253,26 @@ has no single `base_dir` since it applies across every project.
   a given extension**, for the rare case where a project needs a specific extension served as
   something other than the server's built-in default. Any extension not listed in `mime_types`
   uses the built-in table's result unchanged.
+
+### Response compression
+
+- Builtin, always on — no config toggle, no module to enable, matching this project's "everything
+  is builtin, there is no module system" model (see "Constraints / non-negotiables").
+- Negotiated per request via the standard `Accept-Encoding` request header; the server picks the
+  best encoding the client advertises, in this preference order: `br` (Brotli), then `gzip`. If the
+  client advertises neither, the response is sent uncompressed — never forced.
+- Only MIME types classified as compressible in the built-in MIME table (text types — HTML, CSS,
+  JS, JSON, XML, SVG, plain text, and similar — see "MIME types") are eligible. Already-compressed
+  binary types (images, video, audio, archives, fonts) are always served as-is, uncompressed,
+  regardless of what the client advertises — compressing already-compressed data wastes CPU for no
+  size benefit and is not how a real server behaves either.
+- A successful compressed response always sets `Content-Encoding` to the chosen encoding and adds
+  `Vary: Accept-Encoding` so caches don't serve the wrong encoding to a different client.
+- Range requests (see "Core behavior") are never combined with compression on the same response —
+  a `Range` request always gets an uncompressed, byte-accurate response, matching standard server
+  behavior (compression changes byte offsets, so the two are mutually exclusive).
+- CGI/script/proxied responses are compressed the same way as static file responses whenever their
+  declared `Content-Type` is eligible and they don't already set their own `Content-Encoding`.
 
 ### Default index and directory listing
 
@@ -473,6 +512,33 @@ script's own choice, not something this server filters. What `--debug` additiona
 whether the *server's own* view into the failure — interpreter stderr, non-zero exit status
 detail, internal stack trace of the exec attempt itself — is also surfaced into the rendered error
 page when the script produces no usable output at all (e.g. it crashes before writing anything).
+
+### Server-Side Includes (SSI)
+
+- Builtin, matching `mod_include`'s classic directive set — no module to enable, per this
+  project's "everything is builtin" model (see "Constraints / non-negotiables").
+- Applies to files served with extension `.shtml` by default; the `ssi_extensions` config key
+  (global or per-project, a list of extensions) adds more extensions to the set that get SSI
+  processing — empty list disables SSI entirely for a project.
+- Supported directives: `#include virtual="..."` (path relative to `base_dir`, subject to the same
+  path-traversal containment as every other request) and `#include file="..."` (path relative to
+  the including file's own directory); `#echo var="..."` for the standard CGI environment variables
+  (see "CGI 1.1 protocol semantics" above) plus the SSI-standard `DATE_LOCAL`/`DATE_GMT`/
+  `LAST_MODIFIED`; `#set var="..." value="..."` and `#if`/`#elif`/`#else`/`#endif` conditionals over
+  those variables — matching Apache's core SSI directive set closely enough that existing
+  `.shtml` files from an Apache-oriented project work unmodified.
+- `#exec cmd="..."` / `#exec cgi="..."` (arbitrary shell/CGI execution from within SSI) are
+  intentionally **not** supported — Apache itself disables this by default (`IncludesNOEXEC`) for
+  the same reason: unrestricted shell exec from template content is a well-known injection vector,
+  and there is no config knob to turn it on. This is a deliberate security decision, not a gap —
+  see "Security / access control model."
+- An SSI-processed response is served with `Content-Type: text/html` (matching Apache's
+  `AddOutputFilter INCLUDES` behavior) and is eligible for "Response compression" like any other
+  compressible text response, applied after SSI processing completes.
+- SSI processing failures (missing `#include` target, malformed directive) render inline as an
+  HTML comment error marker in the output, matching Apache's default `[an error occurred while
+  processing this directive]` behavior — they do not abort the whole response or change the status
+  code, matching how a real SSI-capable server degrades.
 
 ### Framework dev-server proxying
 
@@ -772,6 +838,59 @@ distinct failure modes are both explicitly out of scope for cashttpd to ever pro
 - No child PID is ever persisted to disk/config and reused across cashttpd restarts — every
   restart starts with zero tracked children, so there is no stale-PID reconciliation logic that
   could itself mis-signal an unrelated process that happens to reuse an old PID.
+
+### Default security headers
+
+- Builtin, on by default, no module to enable — matching this project's "everything is builtin"
+  model (AI.md's security-by-design posture also applies in full to this project even though it is
+  local-dev-only; see "Constraints / non-negotiables") and matching how a real hardened httpd/nginx
+  deployment is configured.
+- Set on every response (static, directory listing, script/CGI, SSI, proxied) unless already set by
+  the response itself (a script/CGI/proxied upstream's own header always wins — the server never
+  overwrites a header the response already provided):
+  - `X-Content-Type-Options: nosniff`
+  - `X-Frame-Options: SAMEORIGIN`
+  - `Referrer-Policy: no-referrer-when-downgrade`
+  - `Strict-Transport-Security: max-age=31536000; includeSubDomains` — only added when
+    `tls.enabled: true` (HSTS on a plain-HTTP response is meaningless and actively wrong).
+- `Content-Security-Policy` and `X-XSS-Protection` are deliberately **not** set by default: CSP
+  needs per-project tuning to avoid breaking dev-server content (inline scripts, framework dev
+  tooling, hot-reload websockets) in ways a one-size-fits-all default can't anticipate safely, and
+  `X-XSS-Protection` is a deprecated/removed browser feature with no effect in current browsers.
+  Both can be added via `security_headers` (below) when a project wants them.
+- The `security_headers` config key (global or per-project) overrides, adds, or removes (empty/
+  `null` value) any of the above, or sets additional headers not in the built-in set — same
+  override-merge pattern as `mime_types`/`script_handlers`.
+
+**`Server` header (`server_tokens`).** Mirrors Apache's `ServerTokens` directive and its exact
+option set, so the config value is immediately familiar to anyone who has run httpd: `Full` (the
+default — `Server: cashttpd/{version} ({os}; {arch})`), `OS` (`Server: cashttpd/{version} ({os})`),
+`Minor` (`Server: cashttpd/{major}.{minor}`), `Major` (`Server: cashttpd/{major}`), `Min`
+(`Server: cashttpd/{version}`, no parenthetical), and `Prod` (`Server: cashttpd` — name only,
+matching Apache's `ProductOnly` alias). Default is `Full`, matching Apache's own out-of-the-box
+default — this is a local-dev-only tool, so there's no production-hardening reason to diverge from
+the well-known default here. A project wanting a minimal header sets `server_tokens: Prod`. There
+is no "omit the header entirely" mode built in — a project that wants that removes it via
+`security_headers` (`Server: null`) since it uses the same override-merge mechanism.
+
+**`Cache-Control`/`Expires` (no default).** Unlike the headers above, cashttpd sets **no** default
+`Cache-Control` or `Expires` header on static responses — this is deliberately different from a
+production httpd/nginx `mod_expires` setup, because a stale-cached asset actively fights the
+edit-and-reload workflow this project exists for (see "One Coherent Product" / "Constraints /
+non-negotiables"). A project that wants caching semantics sets `Cache-Control`/`Expires` explicitly
+via `security_headers` (which, despite the name, is the one general per-header override/add
+mechanism — it is not restricted to headers with security meaning).
+
+**CORS (`cors`).** Permissive by default — `Access-Control-Allow-Origin: *` (and, when the request
+includes `Access-Control-Request-Method`/`-Headers`, i.e. a CORS preflight, an
+`Access-Control-Allow-Methods`/`Access-Control-Allow-Headers` response echoing what was requested) —
+matching how most local framework dev servers already behave, so a frontend dev server on one port
+can call a cashttpd-served API/static asset on another without the developer having to configure
+anything first. `Access-Control-Allow-Credentials` is never set to `true` by default (that combined
+with a wildcard origin is invalid per the Fetch spec and browsers reject it outright); a project
+needing credentialed CORS must set both explicitly via `cors`. The `cors` config key (global or
+per-project) is a map of the CORS header names it overrides/adds (same override-merge pattern as
+`security_headers`), or the literal `false` to disable CORS headers entirely for that project.
 
 ### Security / access control model
 
