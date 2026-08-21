@@ -27,22 +27,31 @@ COPY . .
 # aarch64-unknown-linux-musl's self-contained rustup sysroot is less complete
 # than x86_64-unknown-linux-musl's: linking the proc-macro crates this
 # project depends on (tokio-macros, futures-macro, thiserror-impl — always
-# built for the host, dynamically, even under `-C target-feature=+crt-static`
-# for the target) fails with "rust-lld: error: unable to find library
-# -lgcc_s" / "-lc" on aarch64 because casjaysdev/rust:latest ships neither
-# package (confirmed via a real CI run: the identical x86_64 build succeeds
-# without them). `gcc`+`musl-dev` install those two libraries into
-# /usr/lib (confirmed via `apk info -L`), but rust-lld's invocation only
-# passes `-L` for the rustlib sysroot and the raw-dylibs dir, never
-# /usr/lib — so the packages alone are not enough; RUSTFLAGS="-L /usr/lib"
-# below adds the missing search path so rust-lld can actually find them.
+# built for the host, as a dynamically-loaded .so, regardless of
+# `-C target-feature=+crt-static` for the target) fails with "rust-lld:
+# error: unable to find library -lgcc_s" / "-lc" on aarch64 because
+# casjaysdev/rust:latest ships neither package (confirmed via a real CI
+# run: the identical x86_64 build succeeds without them). `gcc`+`musl-dev`
+# install those two libraries into /usr/lib (confirmed via `apk info -L`),
+# but a RUSTFLAGS="-L /usr/lib" env var does NOT reach this link step:
+# proc-macro/build-script (host) compilations are never given RUSTFLAGS or
+# target.<triple>.rustflags, by design, even when host==target as it does
+# here (confirmed empirically: `cargo build -v` with a RUSTFLAGS marker
+# never shows it on any --crate-type proc-macro invocation). The only path
+# rust-lld actually searches unconditionally is the target's rustlib
+# sysroot dir, so symlink the two libraries there instead.
 RUN apk add --no-cache gcc musl-dev
 RUN set -eu; \
     case "$(uname -m)" in \
       x86_64) RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-      aarch64) RUST_TARGET="aarch64-unknown-linux-musl"; export RUSTFLAGS="-L /usr/lib" ;; \
+      aarch64) RUST_TARGET="aarch64-unknown-linux-musl" ;; \
       *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
     esac; \
+    if [ "${RUST_TARGET}" = "aarch64-unknown-linux-musl" ]; then \
+      SYSROOT_LIB="$(rustc --print sysroot)/lib/rustlib/${RUST_TARGET}/lib"; \
+      ln -sf /usr/lib/libgcc_s.so "${SYSROOT_LIB}/libgcc_s.so"; \
+      ln -sf /usr/lib/libc.so "${SYSROOT_LIB}/libc.so"; \
+    fi; \
     cargo build --release --target "${RUST_TARGET}"; \
     mkdir -p /out; \
     cp "target/${RUST_TARGET}/release/cashttpd" /out/cashttpd
