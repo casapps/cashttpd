@@ -15,8 +15,8 @@
 //! listener implementation (see TODO.AI.md); this module owns signal
 //! registration and the shutdown-flag state machine only.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::flag;

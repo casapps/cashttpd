@@ -2,6 +2,7 @@
 //! fallback (AI.md PART 3), and the `serve` subcommand entry point (AI.md
 //! PART 14 "Runtime Model": `serve` always forces CLI mode).
 
+use clap::parser::ValueSource;
 use clap::{Arg, ArgAction, Command};
 
 /// Builds the top-level flag/subcommand grammar for the CLI-style surface
@@ -12,7 +13,9 @@ use clap::{Arg, ArgAction, Command};
 /// per-subcommand help generated for free instead of hand-rolled
 /// `std::env::args()` scanning. `--version` keeps its own hand-written
 /// output (embedded build metadata), so clap's automatic version flag is
-/// disabled.
+/// disabled here and replaced below with an equivalent `--version`/`-v`
+/// arg (AI.md "Standard CLI Flags" — `-v` is the required short form) that
+/// this module's own handler renders.
 fn cli() -> Command {
     Command::new("cashttpd")
         .about("RFC-compliant local-development HTTP/HTTPS server.")
@@ -20,7 +23,7 @@ fn cli() -> Command {
         .arg(
             Arg::new("version")
                 .long("version")
-                .short('V')
+                .short('v')
                 .help("Print version plus embedded build metadata and exit")
                 .action(ArgAction::SetTrue),
         )
@@ -34,6 +37,7 @@ fn cli() -> Command {
                 )
                 .action(ArgAction::SetTrue),
         )
+        .arg(color_arg())
         .arg(
             Arg::new("daemon")
                 .long("daemon")
@@ -79,6 +83,7 @@ fn cli() -> Command {
                         .value_name("file")
                         .value_parser(clap::value_parser!(std::path::PathBuf)),
                 )
+                .arg(color_arg())
                 .arg(
                     Arg::new("debug")
                         .long("debug")
@@ -86,6 +91,19 @@ fn cli() -> Command {
                         .action(ArgAction::SetTrue),
                 ),
         )
+}
+
+/// The standard three-value `--color` flag, declared identically at the top
+/// level and on `serve` so it is accepted on either side of the subcommand.
+/// There is deliberately no `--no-color`: `--color no` and the `NO_COLOR`
+/// environment variable are the two documented ways to turn color off.
+fn color_arg() -> Arg {
+    Arg::new("color")
+        .long("color")
+        .value_name("when")
+        .default_value("auto")
+        .value_parser(["auto", "yes", "no"])
+        .help("Color output: auto (TTY detect), yes (force on), no (force off)")
 }
 
 /// Entry point for CLI-style mode.
@@ -111,7 +129,20 @@ fn run_with_args(args: &[String]) -> i32 {
         }
     };
 
-    // `--version` / `-V`: print version plus embedded build metadata (AI.md
+    // `--color` is resolved before anything is printed, so even `--version`
+    // and clap's own error output obey it. The subcommand's own occurrence
+    // wins when both are given (`cashttpd --color yes serve --color no`),
+    // matching how clap scopes a repeated flag.
+    let color = matches
+        .subcommand_matches("serve")
+        .filter(|serve| serve.value_source("color") == Some(ValueSource::CommandLine))
+        .and_then(|serve| serve.get_one::<String>("color"))
+        .or_else(|| matches.get_one::<String>("color"))
+        .map(String::as_str)
+        .unwrap_or("auto");
+    crate::supports::color::set_cli_color(crate::supports::color::parse_color_flag(color));
+
+    // `--version` / `-v`: print version plus embedded build metadata (AI.md
     // PART 6 "Build Metadata") and exit.
     if matches.get_flag("version") {
         println!(
@@ -187,7 +218,7 @@ mod tests {
     #[test]
     fn version_flag_prints_and_reports_success() {
         assert_eq!(run_with_args(&args(&["--version"])), 0);
-        assert_eq!(run_with_args(&args(&["-V"])), 0);
+        assert_eq!(run_with_args(&args(&["-v"])), 0);
     }
 
     #[test]
@@ -205,6 +236,31 @@ mod tests {
     fn help_flag_is_provided_by_clap_and_exits_successfully() {
         assert_eq!(run_with_args(&args(&["--help"])), 0);
         assert_eq!(run_with_args(&args(&["-h"])), 0);
+    }
+
+    #[test]
+    fn color_flag_is_accepted_in_both_forms_and_rejects_other_values() {
+        assert_eq!(run_with_args(&args(&["--color", "no", "--version"])), 0);
+        assert_eq!(run_with_args(&args(&["--color=yes", "--version"])), 0);
+        assert_eq!(run_with_args(&args(&["--color", "auto", "--version"])), 0);
+        assert_ne!(run_with_args(&args(&["--color", "sometimes"])), 0);
+    }
+
+    #[test]
+    fn color_flag_is_also_accepted_on_the_serve_subcommand() {
+        let matches = cli()
+            .try_get_matches_from(args(&["serve", "--color", "no"]))
+            .expect("serve accepts --color");
+        let serve = matches.subcommand_matches("serve").unwrap();
+        assert_eq!(
+            serve.get_one::<String>("color").map(String::as_str),
+            Some("no")
+        );
+        assert_eq!(
+            serve.value_source("color"),
+            Some(ValueSource::CommandLine),
+            "an explicit serve-level --color must outrank the top-level default"
+        );
     }
 
     #[test]

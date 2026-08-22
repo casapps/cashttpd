@@ -13,7 +13,7 @@ pub const SERVICE_USER: &str = "cashttpd";
 /// privilege drop only applies to the root-started-in-container case.
 #[cfg(unix)]
 pub fn drop_privileges_if_root() -> std::io::Result<()> {
-    use nix::unistd::{Uid, setgid, setuid};
+    use nix::unistd::{setgid, setuid, Uid};
 
     if !Uid::effective().is_root() {
         return Ok(());

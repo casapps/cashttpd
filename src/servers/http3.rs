@@ -19,7 +19,7 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use http_body_util::BodyExt;
 
-use super::{MAX_REQUEST_BODY, Request, ServeContext};
+use super::{Request, ServeContext, MAX_REQUEST_BODY};
 
 /// Concurrent QUIC connections accepted at once. QUIC connections are cheap
 /// to open and expensive to keep (each holds congestion-control and packet
@@ -187,7 +187,7 @@ async fn serve_stream(
     }
 
     let response = if oversized {
-        super::dispatch_status(&ctx, &request, &client, 413, 0)
+        super::dispatch_status(&ctx, &request, &client, 413, 0).await
     } else {
         super::dispatch(&ctx, &request, Bytes::from(body), &client, None).await
     };

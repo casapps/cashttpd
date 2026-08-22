@@ -5,6 +5,32 @@
 //! token palette here — see AI.md PART 7 "Color Palette" for that rule.
 
 use std::io::IsTerminal;
+use std::sync::OnceLock;
+
+/// The resolved `--color` flag, recorded once at startup by
+/// `crate::uis::cli` so every later `color_enabled(None)` call site honors it
+/// without having to thread the flag through the whole call graph. `None`
+/// means `--color auto` (or no flag at all), which falls through to the
+/// `NO_COLOR`/TTY detection below.
+static CLI_FORCE_COLOR: OnceLock<Option<bool>> = OnceLock::new();
+
+/// Records the resolved `--color` choice for the rest of the process. Only
+/// the first call takes effect — the flag is parsed once, at startup, and a
+/// later caller must not be able to flip color mid-run.
+pub fn set_cli_color(choice: Option<bool>) {
+    let _ = CLI_FORCE_COLOR.set(choice);
+}
+
+/// Maps the `--color` flag's three documented values to a forced setting.
+/// `auto` (and anything else clap could not have produced) yields `None`,
+/// i.e. detect.
+pub fn parse_color_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
 
 /// ANSI 16-color indices (0-15) for TUI/CLI semantic roles.
 /// `ratatui::style::Color::Indexed()` and the `ESC[38;5;{n}m` escape both
@@ -62,8 +88,10 @@ pub fn terminal_palette_light() -> TerminalPalette {
 /// Precedence: CLI flag > config file > `NO_COLOR` env var > TTY/TERM
 /// auto-detect.
 pub fn color_enabled(force_color: Option<bool>) -> bool {
-    // 1. CLI flag overrides everything.
-    if let Some(forced) = force_color {
+    // 1. CLI flag overrides everything — either passed directly by the
+    //    caller, or the `--color yes`/`--color no` recorded at startup.
+    let forced = force_color.or_else(|| CLI_FORCE_COLOR.get().copied().flatten());
+    if let Some(forced) = forced {
         return forced;
     }
 
@@ -98,6 +126,14 @@ mod tests {
     fn forced_flag_wins() {
         assert!(color_enabled(Some(true)));
         assert!(!color_enabled(Some(false)));
+    }
+
+    #[test]
+    fn color_flag_values_map_to_forced_settings() {
+        assert_eq!(parse_color_flag("yes"), Some(true));
+        assert_eq!(parse_color_flag("YES"), Some(true));
+        assert_eq!(parse_color_flag("no"), Some(false));
+        assert_eq!(parse_color_flag("auto"), None);
     }
 
     #[test]

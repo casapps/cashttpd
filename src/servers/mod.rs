@@ -103,10 +103,13 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
 use crate::supports::signal;
 
+mod compress;
+mod headers;
 mod htaccess;
 mod http3;
 mod info;
 mod proxy;
+mod ssi;
 mod tls;
 
 /// The single response body type every handler in this crate produces.
@@ -190,6 +193,12 @@ fn fallback_defaults() -> ServeOptions {
         directory_listing: false,
         mime_types: Default::default(),
         script_handlers: Default::default(),
+        ssi_extensions: crate::configs::builtin_ssi_extensions(),
+        security_headers: crate::configs::builtin_security_headers(
+            false,
+            crate::configs::ServerTokens::Full,
+        ),
+        cors: Some(crate::configs::builtin_cors_headers()),
         proxy: Default::default(),
         logging_access_format: "combined".to_string(),
         logging_access_rotate: "daily".to_string(),
@@ -450,9 +459,17 @@ pub fn run(
                 };
             match accepted {
                 Ok((stream, addr)) => {
+                    // A poisoned mutex here would only mean some other
+                    // accept-loop task panicked while holding it; the
+                    // snapshot itself is still valid data, so recover it
+                    // rather than propagating the panic into this request.
                     let ctx = ServeContext {
                         base_dir: Arc::clone(&base_dir),
-                        state: Arc::clone(&runtime.lock().unwrap()),
+                        state: Arc::clone(
+                            &runtime
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        ),
                         stats: Arc::clone(&stats),
                     };
                     tokio::spawn(async move {
@@ -463,9 +480,10 @@ pub fn run(
                     });
                 }
                 Err(err) => {
+                    // See the poisoned-mutex-recovery comment above.
                     runtime
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .logger
                         .error(&format!("accept error: {err}"));
                 }
@@ -559,7 +577,12 @@ fn spawn_http3(
     base_dir: &Arc<PathBuf>,
     stats: &Arc<info::Stats>,
 ) -> Option<http3::Handle> {
-    let state = Arc::clone(&runtime.lock().unwrap());
+    // See the poisoned-mutex-recovery comment in the accept loop above.
+    let state = Arc::clone(
+        &runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     let quic = Arc::clone(&state.tls_config.as_ref()?.quic);
     let addr = match accept.local_addr() {
         Ok(addr) => addr,
@@ -728,7 +751,12 @@ fn apply_reload(
     shutdown: &signal::ShutdownState,
     stats: &info::Stats,
 ) -> bool {
-    let current = Arc::clone(&runtime.lock().unwrap());
+    // See the poisoned-mutex-recovery comment in the accept loop above.
+    let current = Arc::clone(
+        &runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
 
     let mut new_opts = match crate::configs::load(cli, false) {
         Ok(o) => o,
@@ -852,7 +880,10 @@ fn apply_reload(
         proxy_target,
         logger: logger.clone(),
     });
-    *runtime.lock().unwrap() = updated;
+    // See the poisoned-mutex-recovery comment in the accept loop above.
+    *runtime
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = updated;
 
     logger.error(&format!(
         "config reload applied{}",
@@ -1161,7 +1192,7 @@ async fn serve_hyper_request(
         .get("content-length")
         .and_then(|v| v.trim().parse().ok());
     if declared.is_some_and(|len| len > MAX_REQUEST_BODY) {
-        return Ok(dispatch_status(&ctx, &request, &client, 413, 0));
+        return Ok(dispatch_status(&ctx, &request, &client, 413, 0).await);
     }
 
     let body = match http_body_util::Limited::new(incoming, MAX_REQUEST_BODY as usize)
@@ -1183,7 +1214,7 @@ async fn serve_hyper_request(
             } else {
                 400
             };
-            return Ok(dispatch_status(&ctx, &request, &client, status, 0));
+            return Ok(dispatch_status(&ctx, &request, &client, status, 0).await);
         }
     };
 
@@ -1194,7 +1225,7 @@ async fn serve_hyper_request(
 /// the handler pipeline (body too large, or unreadable). Kept on the same
 /// logging/stats path as a served request so a rejected request is still
 /// visible in the access log and on `/server-info`.
-fn dispatch_status(
+async fn dispatch_status(
     ctx: &ServeContext,
     request: &Request,
     client: &str,
@@ -1207,7 +1238,7 @@ fn dispatch_status(
             StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         fallback
     });
-    finish_response(ctx, request, client, response, body_len)
+    finish_response(ctx, request, client, response, body_len).await
 }
 
 /// The one entry point every protocol version funnels through: runs the
@@ -1238,13 +1269,21 @@ async fn dispatch(
             })
         }
     };
-    finish_response(ctx, request, client, response, body_len)
+    finish_response(ctx, request, client, response, body_len).await
 }
 
 /// Response post-processing shared by every protocol version: advertises
-/// HTTP/3 when it is actually running, then records the exchange in the
-/// `/server-info` statistics and the on-disk access log.
-fn finish_response(
+/// HTTP/3 when it is actually running, attaches the default security/`Server`
+/// /CORS headers, negotiates response compression, and only then records the
+/// exchange in the `/server-info` statistics and the on-disk access log.
+///
+/// Ordering matters in both directions here. Headers and compression run
+/// before `response_bytes` so the access log and the dashboard report the
+/// bytes actually put on the wire rather than the pre-compression size, and
+/// they run after every handler has returned so a CGI script's or a proxied
+/// upstream's own headers are already in place for `headers::apply` to
+/// defer to.
+async fn finish_response(
     ctx: &ServeContext,
     request: &Request,
     client: &str,
@@ -1261,6 +1300,13 @@ fn finish_response(
             response.headers_mut().insert(http::header::ALT_SVC, value);
         }
     }
+
+    headers::apply(&mut response, request, &ctx.state.opts);
+    compress::maybe_compress(
+        &mut response,
+        request.headers.get("accept-encoding").map(String::as_str),
+    )
+    .await;
 
     let status = response.status().as_u16();
     let bytes = response_bytes(&response);
@@ -1559,6 +1605,17 @@ async fn handle_request(
         }
     }
 
+    // A CORS preflight is answered here, after the framework-proxy check (so
+    // a dev server that implements its own CORS policy still sees it) but
+    // before path resolution: a preflight names no resource to act on, and
+    // falling through would answer it `405`, which browsers read as a failed
+    // preflight. `headers::apply` attaches the method/header echo on the way
+    // out, on this response like any other.
+    if let Some(response) = headers::preflight_response(request, opts) {
+        stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
+        return Ok(response);
+    }
+
     // Phase 1 (IDEA.md 6-phase evaluation order): rewrite/redirect first,
     // it can change the target path/resource before anything else runs.
     let mut rules = htaccess_rules_for(base_dir, &decoded);
@@ -1763,7 +1820,8 @@ async fn handle_request(
                     stats.record_handler(handler, handler_started.elapsed());
                     return outcome;
                 }
-                let outcome = serve_file(&candidate_index, request, opts, head_only).await;
+                let outcome =
+                    serve_file(&candidate_index, base_dir, request, opts, client, head_only).await;
                 stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
                 return outcome;
             }
@@ -1795,7 +1853,7 @@ async fn handle_request(
     if request.method != "GET" && request.method != "HEAD" {
         return respond_with_error_document(405, request, opts, base_dir, &rules).await;
     }
-    let outcome = serve_file(&resolved, request, opts, head_only).await;
+    let outcome = serve_file(&resolved, base_dir, request, opts, client, head_only).await;
     stats.record_handler(info::HandlerType::StaticFile, handler_started.elapsed());
     outcome
 }
@@ -2368,8 +2426,10 @@ fn content_type_for(path: &Path, opts: &ServeOptions) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn serve_file(
     path: &Path,
+    base_dir: &Path,
     request: &Request,
     opts: &ServeOptions,
+    client: &str,
     head_only: bool,
 ) -> std::io::Result<Response<Body>> {
     let metadata = match tokio::fs::metadata(path).await {
@@ -2377,6 +2437,15 @@ async fn serve_file(
         Err(_) => return respond_error(404, request, opts),
     };
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // Server-Side Includes (IDEA.md "Server-Side Includes (SSI)") take over
+    // before any conditional-request or `Range` handling: the composed output
+    // is not the file on disk, so this file's size, mtime, and byte offsets
+    // do not describe it (see `ssi::serve`).
+    if ssi::applies(path, opts) {
+        return ssi::serve(path, base_dir, request, opts, client, head_only, modified).await;
+    }
+
     let len = metadata.len();
     let etag = etag_for(len, modified);
     let last_modified = http_date(modified);
@@ -2912,6 +2981,12 @@ mod tests {
             logging_error_format: "standard".to_string(),
             logging_error_rotate: "daily".to_string(),
             logging_error_keep: "30d".to_string(),
+            ssi_extensions: crate::configs::builtin_ssi_extensions(),
+            security_headers: crate::configs::builtin_security_headers(
+                false,
+                crate::configs::ServerTokens::Full,
+            ),
+            cors: Some(crate::configs::builtin_cors_headers()),
             project_config_path: PathBuf::new(),
         }
     }
@@ -3733,9 +3808,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let base_dir = dir.canonicalize().unwrap();
         let config_home = unique_dir("reload-conflict-config-home");
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
 
         let cli = crate::configs::CliOverrides {
             base_dir: Some(base_dir.clone()),
@@ -3795,9 +3868,7 @@ mod tests {
         assert!(dashboard.contains("config reload issue"));
 
         drop(blocker);
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        std::env::remove_var("XDG_CONFIG_HOME");
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&config_home).ok();
     }

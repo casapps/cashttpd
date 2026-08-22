@@ -37,9 +37,25 @@ pub struct Layer {
     pub directory_listing: Option<bool>,
     pub mime_types: BTreeMap<String, String>,
     pub script_handlers: BTreeMap<String, Option<String>>,
+    pub ssi_extensions: Option<Vec<String>>,
+    pub security_headers: BTreeMap<String, Option<String>>,
+    pub server_tokens: Option<String>,
+    pub cors: Option<CorsLayer>,
     pub proxy: ProxyLayer,
     pub logging_access: LogStreamLayer,
     pub logging_error: LogStreamLayer,
+}
+
+/// The `cors` config key's two shapes (IDEA.md "Default security headers" →
+/// "CORS"): a header map that overrides/adds to the permissive built-in set,
+/// or the literal `false`, which disables CORS response headers entirely.
+/// A missing key is `None` on the `Layer` and falls through to the next
+/// layer — distinct from `Some(CorsLayer::Disabled)`, which is an explicit
+/// "off" that the lower layer must not undo.
+#[derive(Debug, Clone)]
+pub enum CorsLayer {
+    Disabled,
+    Headers(BTreeMap<String, Option<String>>),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -94,6 +110,171 @@ fn opt_str_map(v: &Value, key: &str) -> BTreeMap<String, Option<String>> {
         .unwrap_or_default()
 }
 
+fn str_list(v: &Value, key: &str) -> Option<Vec<String>> {
+    let seq = v.get(key)?.as_sequence()?;
+    Some(
+        seq.iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+fn cors_layer(v: &Value) -> Option<CorsLayer> {
+    let raw = v.get("cors")?;
+    if raw.as_bool() == Some(false) {
+        return Some(CorsLayer::Disabled);
+    }
+    // `cors: true` is accepted as a synonym for "keep the permissive
+    // built-in set" so a config that spells the toggle out explicitly still
+    // parses, rather than being silently read as an empty override map.
+    if raw.as_bool() == Some(true) {
+        return Some(CorsLayer::Headers(BTreeMap::new()));
+    }
+    raw.as_mapping().map(|m| {
+        CorsLayer::Headers(
+            m.iter()
+                .filter_map(|(k, val)| {
+                    Some((k.as_str()?.to_string(), val.as_str().map(str::to_string)))
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Built-in Server-Side Includes extension list (IDEA.md "Server-Side
+/// Includes (SSI)"). The `ssi_extensions` config key adds to this list, with
+/// an empty list as the documented way to disable SSI entirely for a project
+/// (see the merge in `load`).
+pub fn builtin_ssi_extensions() -> Vec<String> {
+    vec![".shtml".to_string()]
+}
+
+/// The `Server` response header's verbosity, mirroring Apache's
+/// `ServerTokens` directive and its exact option set (IDEA.md "Default
+/// security headers" → "`Server` header").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTokens {
+    Full,
+    Os,
+    Minor,
+    Major,
+    Min,
+    Prod,
+}
+
+impl ServerTokens {
+    /// Parses a config value case-insensitively. Apache's `ProductOnly` is
+    /// accepted as the documented alias for `Prod`. An unrecognized value
+    /// falls back to the `Full` default rather than failing startup, since
+    /// a typo here must not take a local dev server down.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "os" => Self::Os,
+            "minor" => Self::Minor,
+            "major" => Self::Major,
+            "min" => Self::Min,
+            "prod" | "productonly" => Self::Prod,
+            _ => Self::Full,
+        }
+    }
+
+    /// Renders the `Server` header value for this verbosity level. `{os}`
+    /// and `{arch}` come from the compile-time target triple constants, so
+    /// they describe the binary that is actually running.
+    pub fn header_value(self) -> String {
+        let version = crate::supports::version::VERSION;
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let mut parts = version.split('.');
+        let major = parts.next().unwrap_or("0");
+        let minor = parts.next().unwrap_or("0");
+        match self {
+            Self::Full => format!("cashttpd/{version} ({os}; {arch})"),
+            Self::Os => format!("cashttpd/{version} ({os})"),
+            Self::Minor => format!("cashttpd/{major}.{minor}"),
+            Self::Major => format!("cashttpd/{major}"),
+            Self::Min => format!("cashttpd/{version}"),
+            Self::Prod => "cashttpd".to_string(),
+        }
+    }
+}
+
+/// Built-in response headers set on every response unless the response
+/// already carries them (IDEA.md "Default security headers"). `Server` is
+/// part of this set so the `security_headers` override mechanism is the one
+/// way to change or remove any default header, including it.
+///
+/// `Strict-Transport-Security` is included only when TLS is on — HSTS on a
+/// plain-HTTP response is meaningless and actively wrong.
+/// `Content-Security-Policy` and `X-XSS-Protection` are deliberately absent:
+/// CSP needs per-project tuning to avoid breaking framework dev tooling, and
+/// `X-XSS-Protection` is a removed browser feature. Both are addable through
+/// `security_headers`.
+pub fn builtin_security_headers(
+    tls_enabled: bool,
+    server_tokens: ServerTokens,
+) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    m.insert("Server".to_string(), server_tokens.header_value());
+    m.insert("X-Content-Type-Options".to_string(), "nosniff".to_string());
+    m.insert("X-Frame-Options".to_string(), "SAMEORIGIN".to_string());
+    m.insert(
+        "Referrer-Policy".to_string(),
+        "no-referrer-when-downgrade".to_string(),
+    );
+    if tls_enabled {
+        m.insert(
+            "Strict-Transport-Security".to_string(),
+            "max-age=31536000; includeSubDomains".to_string(),
+        );
+    }
+    m
+}
+
+/// Built-in permissive CORS response headers (IDEA.md "Default security
+/// headers" → "CORS"). Only the wildcard origin is unconditional; the
+/// preflight `Access-Control-Allow-Methods`/`-Headers` echo is request-
+/// dependent and is added by `crate::servers::headers` at response time.
+/// `Access-Control-Allow-Credentials` is deliberately absent — `true`
+/// combined with a wildcard origin is invalid per the Fetch spec and
+/// browsers reject the response outright.
+pub fn builtin_cors_headers() -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    m.insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
+    m
+}
+
+/// Applies one override layer's `name -> value | null` map onto a resolved
+/// header map: a value replaces or adds the header, and an empty/`null`
+/// value removes it. Shared by `security_headers` and `cors`, which IDEA.md
+/// documents as using the same override-merge pattern.
+///
+/// Matching against the built-in set is case-insensitive because HTTP field
+/// names are (RFC 9110 §5.1) — `server: null` in a config file has to remove
+/// the same header `Server` added, not add a second one. The built-in
+/// spelling is kept when a key matches an existing one so the wire output
+/// stays canonically cased.
+fn merge_header_overrides(
+    base: &mut BTreeMap<String, String>,
+    overrides: &BTreeMap<String, Option<String>>,
+) {
+    for (name, value) in overrides {
+        let existing = base
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        match value {
+            Some(v) if !v.is_empty() => {
+                base.insert(existing, v.clone());
+            }
+            _ => {
+                base.remove(&existing);
+            }
+        }
+    }
+}
+
 /// Built-in extension → interpreter command table (IDEA.md "Multi-language
 /// script execution" → "Built-in table"). `script_handlers` config
 /// (global then per-project) merges on top of this key-by-key — it never
@@ -145,6 +326,10 @@ fn parse_layer(value: &Value) -> Layer {
         directory_listing: b(value, "directory_listing"),
         mime_types: str_map(value, "mime_types"),
         script_handlers: opt_str_map(value, "script_handlers"),
+        ssi_extensions: str_list(value, "ssi_extensions"),
+        security_headers: opt_str_map(value, "security_headers"),
+        server_tokens: s(value, "server_tokens"),
+        cors: cors_layer(value),
         proxy,
         logging_access,
         logging_error,
@@ -154,12 +339,6 @@ fn parse_layer(value: &Value) -> Layer {
 /// The fully resolved, concrete configuration `serve` actually runs with,
 /// after applying CLI > env > per-project > global > built-in-default
 /// precedence to every key in `Layer`.
-// `script_handlers`, `proxy`, the `logging_*` format/rotate/keep fields, and
-// `project_config_path` are parsed and resolved in full per IDEA.md's
-// schema, but nothing consumes them yet — CGI/script execution, dev-server
-// proxying, custom access/error log formats, and scheduled log rotation are
-// still open (see TODO.AI.md). `#[allow(dead_code)]` here documents that
-// gap explicitly rather than silently dropping the parsed values.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub base_dir: PathBuf,
@@ -172,15 +351,40 @@ pub struct Resolved {
     pub directory_listing: bool,
     pub mime_types: BTreeMap<String, String>,
     pub script_handlers: BTreeMap<String, Option<String>>,
+    /// Extensions (leading dot included) whose responses get Server-Side
+    /// Includes processing; empty disables SSI for this project.
+    pub ssi_extensions: Vec<String>,
+    /// The effective default response headers, already merged: built-in
+    /// defaults (including `Server` and the TLS-conditional HSTS header)
+    /// with the `security_headers` overrides applied and removals dropped.
+    pub security_headers: BTreeMap<String, String>,
+    /// Effective CORS response headers, or `None` when `cors: false`
+    /// disabled them. The request-dependent preflight echo is added on top
+    /// of this at response time by `crate::servers::headers`.
+    pub cors: Option<BTreeMap<String, String>>,
     pub proxy: ProxyLayer,
+    // The access/error log *format* keys are parsed and resolved in full per
+    // IDEA.md's schema, but `supports::rotation`-driven logging currently
+    // emits only the documented `combined`/`standard` defaults — custom
+    // format strings are still open (see TODO.AI.md), so nothing reads these
+    // two fields yet. The `allow` keeps that gap explicit rather than
+    // silently dropping the parsed values.
     #[allow(dead_code)]
     pub logging_access_format: String,
     pub logging_access_rotate: String,
     pub logging_access_keep: String,
+    // Same gap as `logging_access_format` above: resolved per the schema,
+    // not yet consumed by the error-log writer.
     #[allow(dead_code)]
     pub logging_error_format: String,
     pub logging_error_rotate: String,
     pub logging_error_keep: String,
+    // The per-project config path is resolved here so a caller can report
+    // which file a setting came from; the live-reload watcher derives the
+    // same path independently via `config_paths` (which it must, since it
+    // has to poll both files before any `Resolved` exists), so this copy has
+    // no reader today. Kept because it is part of the resolved configuration
+    // a future `--config-test`/`/server-info` detail view reports verbatim.
     #[allow(dead_code)]
     pub project_config_path: PathBuf,
 }
@@ -420,6 +624,61 @@ pub fn load(cli: &CliOverrides, autogenerate: bool) -> io::Result<Resolved> {
     script_handlers.extend(global.script_handlers.clone());
     script_handlers.extend(project.script_handlers.clone());
 
+    // `ssi_extensions` *adds* to the built-in set rather than replacing it,
+    // with the one special case IDEA.md calls out explicitly: an empty list
+    // disables SSI entirely, so it clears the set instead of being a no-op
+    // union. Later layers still apply after a clear, which is what lets a
+    // project re-enable SSI over a global `ssi_extensions: []`.
+    let mut ssi_extensions = builtin_ssi_extensions();
+    for layer in [&global.ssi_extensions, &project.ssi_extensions] {
+        let Some(list) = layer else { continue };
+        if list.is_empty() {
+            ssi_extensions.clear();
+            continue;
+        }
+        // Every entry is normalized to a leading dot and lowercased so
+        // `shtml`, `.shtml`, and `.SHTML` all name the same extension, and
+        // a repeat across layers collapses instead of accumulating.
+        for ext in list {
+            let ext = ext.trim().to_ascii_lowercase();
+            let ext = if ext.starts_with('.') {
+                ext
+            } else {
+                format!(".{ext}")
+            };
+            if !ssi_extensions.contains(&ext) {
+                ssi_extensions.push(ext);
+            }
+        }
+    }
+
+    let server_tokens = pick_string(None, "CASHTTPD_SERVER_TOKENS")
+        .or_else(|| project.server_tokens.clone())
+        .or_else(|| global.server_tokens.clone())
+        .map(|v| ServerTokens::parse(&v))
+        .unwrap_or(ServerTokens::Full);
+
+    let mut security_headers = builtin_security_headers(tls_enabled, server_tokens);
+    merge_header_overrides(&mut security_headers, &global.security_headers);
+    merge_header_overrides(&mut security_headers, &project.security_headers);
+
+    // An explicit `cors: false` at either layer disables CORS; the
+    // per-project layer still wins, so a project can re-enable it over a
+    // global `false` by supplying its own header map.
+    let cors = match (global.cors.clone(), project.cors.clone()) {
+        (_, Some(CorsLayer::Disabled)) | (Some(CorsLayer::Disabled), None) => None,
+        (global_cors, project_cors) => {
+            let mut headers = builtin_cors_headers();
+            if let Some(CorsLayer::Headers(overrides)) = global_cors {
+                merge_header_overrides(&mut headers, &overrides);
+            }
+            if let Some(CorsLayer::Headers(overrides)) = project_cors {
+                merge_header_overrides(&mut headers, &overrides);
+            }
+            Some(headers)
+        }
+    };
+
     let proxy = ProxyLayer {
         enabled: project.proxy.enabled.or(global.proxy.enabled),
         kind: project
@@ -492,6 +751,9 @@ pub fn load(cli: &CliOverrides, autogenerate: bool) -> io::Result<Resolved> {
         directory_listing,
         mime_types,
         script_handlers,
+        ssi_extensions,
+        security_headers,
+        cors,
         proxy,
         logging_access_format,
         logging_access_rotate,
@@ -617,9 +879,7 @@ mod tests {
         // Isolate this test's config_dir from the real per-user location by
         // pointing XDG_CONFIG_HOME (used on the non-macOS/Windows path this
         // test runs under in CI) at a private scratch directory.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
 
         let overrides = CliOverrides {
             base_dir: Some(dir.clone()),
@@ -635,9 +895,7 @@ mod tests {
         let reloaded = load(&overrides, false).unwrap();
         assert_eq!(reloaded.port, 12345);
 
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        std::env::remove_var("XDG_CONFIG_HOME");
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&config_home).ok();
     }
@@ -646,9 +904,7 @@ mod tests {
     fn load_cli_override_wins_over_env_var() {
         let dir = unique_dir("load-precedence");
         fs::create_dir_all(&dir).unwrap();
-        unsafe {
-            std::env::set_var("CASHTTPD_PORT", "9999");
-        }
+        std::env::set_var("CASHTTPD_PORT", "9999");
         let overrides = CliOverrides {
             base_dir: Some(dir.clone()),
             port: Some(1111),
@@ -656,9 +912,7 @@ mod tests {
         };
         let resolved = load(&overrides, false).unwrap();
         assert_eq!(resolved.port, 1111);
-        unsafe {
-            std::env::remove_var("CASHTTPD_PORT");
-        }
+        std::env::remove_var("CASHTTPD_PORT");
         fs::remove_dir_all(&dir).ok();
     }
 }

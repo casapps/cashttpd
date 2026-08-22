@@ -319,27 +319,59 @@ scan-range step + `--results=verified,unknown`) were cross-checked and
 ported into `.github/`, `.gitea/`, and `.forgejo/` `ci.yml`/`release.yml`
 where applicable.
 
-## [ ] Implement newly-spec'd builtin features: compression, SSI, security headers, ACME HTTP-01
+## [x] Implement newly-spec'd builtin features: compression, SSI, security headers, ACME HTTP-01 — closed
 Read: IDEA.md "Response compression", "Server-Side Includes (SSI)", "Default security headers",
 "TLS certificate resolution" step 2 (`.well-known/acme-challenge` responder)
-Added to IDEA.md at the user's direction after reviewing real Apache/nginx module
-configs (`/etc/httpd/conf.modules.d/**`, `/etc/httpd/conf.d/**`, `/etc/nginx/global.d/**`) to
-determine which httpd/nginx module-equivalent features cashttpd should treat as always-builtin
-(no module system, ever — see "Constraints / non-negotiables"). Four gaps were confirmed in
-scope and written into IDEA.md, not yet implemented in `src/`:
-- **Response compression**: `Accept-Encoding`-negotiated `br`/`gzip`, compressible-MIME-only,
-  `Content-Encoding`/`Vary` headers, mutually exclusive with `Range` responses.
-- **SSI**: `.shtml` (config-extendable via `ssi_extensions`) — `#include`/`#echo`/`#set`/
-  `#if`-family directives; `#exec` intentionally unsupported (security decision, matches Apache's
-  `IncludesNOEXEC` default).
-- **Default security headers**: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
-  and conditional `Strict-Transport-Security` (TLS-only) on by default; overridable/removable via
-  the new `security_headers` config key; CSP/`X-XSS-Protection` deliberately excluded from the
-  built-in set (see IDEA.md for rationale).
-- **ACME HTTP-01 responder**: temporary port-80 plain-HTTP listener serving
-  `/.well-known/acme-challenge/{token}` only for the duration of a Let's Encrypt cert request
-  (step 2 of "TLS certificate resolution"), closed immediately after; falls through to the
-  self-signed fallback (step 3) if the port-80 bind fails.
+All four are implemented. Everything funnels through `servers::finish_response`, which every
+protocol version (HTTP/1.1, HTTP/2, HTTP/3) already passes through, so no behavior is
+version-specific.
+- **Response compression** — `src/servers/compress.rs`, called from `finish_response` before
+  `response_bytes()` so the access log records wire bytes, not pre-compression bytes. RFC 9110
+  §12.5.3 `Accept-Encoding` parsing with q-values, `identity`, and `*`; `br` preferred over
+  `gzip` at equal quality. Compresses only when the resolved `Content-Type` is in the
+  compressible set, the body has an exact size hint above a small floor, and the response
+  carries no `Content-Range`/`Content-Encoding` (compression and `Range` are mutually
+  exclusive, per IDEA.md). Sets `Content-Encoding`, rewrites `Content-Length`, drops a
+  now-invalid strong `ETag` validator, and always appends `Vary: Accept-Encoding` — including
+  on responses it decides not to compress, so a shared cache never serves a compressed body to
+  a client that did not ask for one. Pure-Rust backends only: `flate2` with `rust_backend`
+  and `brotli` with `default-features = false` (PART 0 "Rust-Only Application").
+  Gap: streamed proxy responses (`src/servers/proxy.rs`) have no exact size hint and are
+  skipped rather than buffered, since buffering an upstream stream of unknown length to
+  compress it would reintroduce an unbounded-memory path.
+- **SSI** — `src/servers/ssi.rs`, hooked in `serve_file` immediately after the file's mtime is
+  read and before ETag/conditional/`Range` handling, so both the index and direct-path call
+  sites are covered. `applies()` matches the resolved `ssi_extensions` set. Supports
+  `#include` (`virtual=`/`file=`), `#echo` (`encoding=none|url|entity`, default `entity`),
+  `#set`, and the full `#if`/`#elif`/`#else`/`#endif` family with Apache's operator set
+  (`= == != < <= > >=`, `&&`, `||`, `!`, parentheses, and `/regex/` right-hand sides via the
+  existing `regex` crate) implemented as a closed recursive-descent grammar in `eval_expr` —
+  it can compare strings and nothing else; there is no path from an expression to process
+  execution, filesystem access, or any interpreter. `#exec cmd=`/`#exec cgi=` renders the
+  standard error marker and is never executed, matching Apache's `IncludesNOEXEC` and the
+  deliberate security exclusion in IDEA.md; a test asserts a `#exec touch` target file never
+  appears. Include resolution canonicalizes and requires containment under the document root
+  (traversal is refused) and caps nesting at 16 to terminate cycles. Rendering is synchronous
+  and recursive, so it runs on `spawn_blocking`. Variables cover the CGI 1.1 set plus the
+  `HTTP_*` request headers and Apache's `DOCUMENT_NAME`/`DOCUMENT_URI`/`LAST_MODIFIED`/
+  `DATE_GMT`/`DATE_LOCAL`.
+  Gaps: SSI output carries no `ETag`, `Last-Modified`, or `Accept-Ranges` — the source file's
+  size and mtime do not describe composed output that may pull in other files. `DATE_LOCAL`
+  is rendered in UTC; a real local offset needs libc `localtime` or bundled tzdata, both
+  excluded by the single-static-binary and Rust-only rules.
+- **Default security headers** — built in `configs::builtin_security_headers` and applied by
+  `src/servers/headers.rs` from `finish_response`. `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: no-referrer-when-downgrade`, plus
+  `Strict-Transport-Security` only when TLS is on. The `security_headers` config key overrides
+  or (with a null/empty value) removes any of them, including `Server`. A header the response
+  already set always wins — the defaults are inserted only when absent. CSP and
+  `X-XSS-Protection` are deliberately not in the built-in set and are addable through the same
+  key.
+- **ACME HTTP-01 responder** — already implemented in `src/servers/tls.rs`
+  (`serve_http01_challenge` + `ChallengeGuard`); verified rather than rewritten. It binds
+  `0.0.0.0:80` for the duration of the cert request, serves only
+  `/.well-known/acme-challenge/{token}`, is stopped by the guard's `Drop`, and falls through
+  to the self-signed path when the bind fails. No code change was needed.
 
 Explicitly out of scope (reviewed and rejected as not being httpd/nginx "modules" — see the
 IDEA.md sections above for the full reasoning): GeoIP/MaxMindDB, munin/mrtg/webalizer/awstats/
@@ -348,22 +380,30 @@ aliases, `UserDir`/`~user` public_html, content-negotiation type-maps/`LanguageP
 FastCGI process-pool PHP (cashttpd's per-request `php-cgi` `script_handlers` dispatch is an
 intentional, already-implemented design choice, not a gap).
 
-## [ ] Implement newly-spec'd response-header defaults: Server, Cache-Control policy, CORS
+## [x] Implement newly-spec'd response-header defaults: Server, Cache-Control policy, CORS — closed
 Read: IDEA.md "Default security headers" ("`Server` header (`server_tokens`)", "`Cache-Control`/
 `Expires` (no default)", "CORS (`cors`)" subsections)
-Three more candidate gaps found in the same `/etc/httpd/conf/httpd.conf` / `/etc/nginx/nginx.conf`
-research pass, confirmed in scope via `AskUserQuestion` and written into IDEA.md, not yet
-implemented in `src/`:
-- **`server_tokens`**: `Server` response header verbosity mirrors Apache's `ServerTokens` option
-  set exactly (`Full`/`OS`/`Minor`/`Major`/`Min`/`Prod`); defaults to `Full`
-  (`Server: cashttpd/{version} ({os}; {arch})`), matching Apache's own out-of-the-box default.
-- **No default `Cache-Control`/`Expires`**: deliberately *not* added by default (unlike a
-  production `mod_expires` setup) — stale caching fights the edit-and-reload dev workflow; a
-  project sets it explicitly via the existing `security_headers` override mechanism if wanted.
-- **`cors`**: permissive default (`Access-Control-Allow-Origin: *` plus preflight
-  method/header echo), matching typical framework dev-server behavior; new `cors` config key
-  (map override, or `false` to disable) — `Access-Control-Allow-Credentials` never defaults to
-  `true` (invalid combined with a wildcard origin per the Fetch spec).
+All three are implemented in `src/configs/mod.rs` (resolution) and `src/servers/headers.rs`
+(application from `servers::finish_response`).
+- **`server_tokens`** — `configs::ServerTokens` with the full Apache option set
+  (`Full`/`OS`/`Minor`/`Major`/`Min`/`Prod`, parsed case-insensitively) and `header_value()`
+  producing the matching verbosity ladder; defaults to `Full`. `Server` is resolved as part of
+  the built-in header map, which means the `security_headers` key is the single mechanism for
+  overriding or removing it — there is no second, special-cased path.
+- **No default `Cache-Control`/`Expires`** — verified absent: nothing in `src/` emits either
+  header by default, and a test in `src/servers/headers.rs` asserts a plain response carries
+  neither, so a future default cannot be added silently. A project that wants caching sets it
+  through `security_headers`.
+- **`cors`** — permissive by default: `Access-Control-Allow-Origin: *` from
+  `configs::builtin_cors_headers`, plus a request-dependent echo of
+  `Access-Control-Request-Method`/`-Headers` into `Access-Control-Allow-Methods`/`-Headers`.
+  `headers::preflight_response` answers a genuine preflight (an `OPTIONS` carrying
+  `Access-Control-Request-Method`) with `204`; it is wired into `handle_request` *after* the
+  framework-proxy dispatch check, so a dev server that implements its own CORS still receives
+  its own preflights. The `cors` config key takes a map of overrides or `false` to disable CORS
+  entirely, using the same override/removal merge as `security_headers`.
+  `Access-Control-Allow-Credentials` is never defaulted — `true` with a wildcard origin is
+  invalid per the Fetch spec and browsers reject the response outright.
 
 ## [ ] `Upgrade: h2c` handshake (RFC 9113 §3.2) is not implemented
 Read: IDEA.md "Core behavior" → "Protocol version negotiation"; AI.md PART 9
@@ -381,7 +421,7 @@ point. Note that no major browser ever shipped `Upgrade: h2c`, so this affects o
 h2c-upgrade-capable CLI clients (`curl --http2` against a plain-HTTP listener, which falls back
 cleanly to HTTP/1.1; `curl --http2-prior-knowledge` gets real HTTP/2).
 
-## [ ] rust-lint findings (pre-existing, unrelated to current work) — 18 issues
+## [x] rust-lint findings (pre-existing, unrelated to current work) — 18 issues — closed
 Read: `~/.claude/memory/rust_conventions.md`, `.github/workflows/release.yml`,
 `.gitea/workflows/release.yml`, `.forgejo/workflows/release.yml`, `src/configs/mod.rs`,
 `src/uis/cli/mod.rs`
@@ -389,11 +429,36 @@ Found by the `rust-lint` agent while gating the HTTP/2+HTTP/3 commit; none of th
 modified by that feature (`Cargo.lock`/`Makefile`/`src/servers/**`) or by the docker-packaging/
 spec-doc work from the same session, so they are logged here rather than folded into an
 unrelated commit:
-- **`Cargo.toml`**: `edition = "2024"` — convention requires `"2021"`.
-- **`src/configs/mod.rs`**: `#[allow(dead_code)]` at lines 176, 180, 184 — each needs an
-  explanatory comment above it per the comment-conventions rule (no bare `#[allow(...)]`).
-- **`src/uis/cli/mod.rs`**: `--color` flag is missing from the CLI definition (required values:
-  `auto`/`yes`/`no`).
-- **Binary naming in release workflows** (`.github/`, `.gitea/`, `.forgejo/` `release.yml` lines
-  54–59, identical in all three): output names use `amd64`/`arm64`/`darwin` — convention
-  requires `x86_64`/`aarch64`/`macos`.
+- **`Cargo.toml`**: `edition = "2024"` → fixed, now `"2021"` in both `Cargo.toml` and
+  `xtask/Cargo.toml`. Six test-only `unsafe { std::env::set_var(...) }` blocks
+  (2 in `src/servers/mod.rs`, 4 in `src/configs/mod.rs`) were unwrapped, since `set_var` is not
+  `unsafe` in edition 2021 and the wrappers became `unused_unsafe` warnings. The genuine
+  `unsafe` in `src/supports/signal.rs` (signal handler registration) is unchanged.
+- **`src/configs/mod.rs`**: `#[allow(dead_code)]` → fixed, each of the three now carries an
+  explanatory comment above it naming the field and why it is resolved but not yet read.
+- **`src/uis/cli/mod.rs`**: `--color` → implemented as `auto`/`yes`/`no` (default `auto`),
+  declared on both the root command and the `serve` subcommand so it is accepted on either side
+  of the subcommand, with an explicit `serve`-level occurrence outranking the top-level default.
+  There is deliberately no `--no-color`: `--color no` and `NO_COLOR` are the two documented ways
+  to turn color off. The resolved choice is recorded once at startup in a `OnceLock` in
+  `src/supports/color.rs` (`set_cli_color`/`parse_color_flag`), which `color_enabled` consults
+  as its highest-precedence input — so existing `color_enabled(None)` call sites honor the flag
+  without threading it through the call graph, and color cannot be flipped mid-run.
+- **Binary naming in release workflows**: rejected, not applied. The finding asked for
+  `x86_64`/`aarch64`/`macos`, but AI.md PART 5 (lines 399–428, "Distribution artifact names")
+  and `~/.claude/memory/rust_conventions.md` § "Platform Targets and Binary Naming" both
+  mandate Go-style terms — `x86_64` maps to `amd64`, `aarch64` to `arm64`, `apple-darwin` to
+  `darwin` — so that Go and Rust releases are named identically. The three `release.yml` files
+  already emit `cashttpd-linux-amd64`, `cashttpd-linux-arm64`, `cashttpd-windows-amd64.exe`,
+  `cashttpd-windows-arm64.exe`, `cashttpd-darwin-amd64`, `cashttpd-darwin-arm64` and are
+  correct as written; applying the rename would have been a regression against the spec. The
+  lint rule that produced this finding is what needs fixing, not the workflows.
+
+Two further `rust-lint` passes over this same batch of changes (compression/SSI/security-headers/
+CORS/server_tokens plus the fixes above) found and closed two more issues before commit:
+- **`src/servers/mod.rs`**: five `Mutex<Arc<RuntimeState>>` `.lock().unwrap()` call sites (accept
+  loop, HTTP/3 listener spawn, config-reload apply/commit) replaced with
+  `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)` — recovers the still-valid snapshot
+  from a poisoned lock instead of panicking the accept loop.
+- **`src/uis/cli/mod.rs`**: `--version`'s short flag was `-V`; AI.md "Standard CLI Flags" requires
+  `-v`. Fixed the `Arg` definition, the explanatory comment, and the matching test.

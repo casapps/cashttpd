@@ -625,6 +625,12 @@ mod tests {
             logging_error_format: "standard".to_string(),
             logging_error_rotate: "daily".to_string(),
             logging_error_keep: "30d".to_string(),
+            ssi_extensions: crate::configs::builtin_ssi_extensions(),
+            security_headers: crate::configs::builtin_security_headers(
+                false,
+                crate::configs::ServerTokens::Full,
+            ),
+            cors: Some(crate::configs::builtin_cors_headers()),
             project_config_path: std::path::PathBuf::new(),
         }
     }

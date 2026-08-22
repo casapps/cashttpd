@@ -375,8 +375,8 @@ fn cert_is_currently_valid(cert_der: &[u8]) -> bool {
 mod acme {
     use super::*;
     use ring::rand::SystemRandom;
-    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
-    use serde_json::{Value, json};
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use serde_json::{json, Value};
     use std::collections::HashMap;
 
     const DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";

@@ -4,7 +4,7 @@ members = ["xtask"]
 [package]
 name         = "cashttpd"
 version      = "0.1.0"
-edition      = "2024"
+edition      = "2021"
 rust-version = "1.85"
 license      = "MIT"
 authors      = ["casapps"]
@@ -161,3 +161,15 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 quinn    = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3       = "0.0.8"
 h3-quinn = "0.0.10"
+# Response compression (IDEA.md "Response compression"): `br` then `gzip`,
+# negotiated from `Accept-Encoding`. Both crates are pure Rust — `flate2` is
+# pinned to `default-features = false` + `rust_backend` (miniz_oxide) rather
+# than its default `libz-sys` backend, which would link system zlib and break
+# the single-static-binary rule (PART 5 "Pure-Rust Library Stack" —
+# Compression row names exactly this pairing); `brotli` is pure Rust with no
+# `*-sys` dependency at all, and its `std` feature is the only one enabled.
+# Zstd is deliberately not offered: the Compression row notes there is no
+# pure-Rust zstd *encoder*, and `zstd`/`zstd-safe` vendors C, which would
+# need an IDEA.md exception for an encoding no browser advertises by default.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = { version = "7", default-features = false, features = ["std"] }

@@ -15,11 +15,11 @@
 //! credentials, `.htpasswd` hashes, or TLS private key material.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::{ServeOptions, html_escape};
+use super::{html_escape, ServeOptions};
 
 /// Which pipeline stage ultimately produced a response — IDEA.md's exact
 /// handler-type breakdown list ("static file, directory listing,
@@ -798,6 +798,12 @@ mod tests {
             logging_error_format: "standard".to_string(),
             logging_error_rotate: "daily".to_string(),
             logging_error_keep: "30d".to_string(),
+            ssi_extensions: crate::configs::builtin_ssi_extensions(),
+            security_headers: crate::configs::builtin_security_headers(
+                false,
+                crate::configs::ServerTokens::Full,
+            ),
+            cors: Some(crate::configs::builtin_cors_headers()),
             project_config_path: PathBuf::new(),
         }
     }
