@@ -135,19 +135,18 @@ jobs:
           merge-multiple: true
 
       - name: Generate SBOM
-        # `cargo-cyclonedx` is not part of casjaysdev/rust:latest (verified
-        # directly against the image), so this builds the local extension
-        # image (docker/Dockerfile.build) rather than `cargo install`-ing it
-        # inline — see that file's header comment for the full rationale.
+        # `cargo-cyclonedx` is part of casjaysdev/rust:latest (verified
+        # directly against the image: /usr/local/bin/cargo-cyclonedx is
+        # present), so this runs straight against the maintained toolchain
+        # image — no local extension image needed (AI.md "Toolchain Image":
+        # never create docker/Dockerfile.build for Rust). Same default-
+        # ENTRYPOINT interception issue as ci.yml's license-compliance job,
+        # hence the identical `--entrypoint sh` override.
         run: |
-          docker build -f docker/Dockerfile.build -t cashttpd-toolchain:release .
-          # cashttpd-toolchain:release is FROM casjaysdev/rust:latest, so it
-          # inherits the same default-ENTRYPOINT interception issue — see the
-          # identical fix and rationale in ci.yml's license-compliance job.
           docker run --rm \
             --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
-            -v "$PWD":/work -w /work cashttpd-toolchain:release -c 'cargo cyclonedx --format json'
+            -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo cyclonedx --format json'
           cp bom.json "binaries/cashttpd-bom.json"
 
       - name: Generate aggregate checksums

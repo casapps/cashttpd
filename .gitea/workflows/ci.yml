@@ -109,20 +109,18 @@ jobs:
             --entrypoint sh \
             -v "$PWD":/work -w /work casjaysdev/rust:latest \
             -c 'cargo deny check licenses advisories bans sources'
-      # `cargo-about` is not part of casjaysdev/rust:latest (verified: neither
-      # the binary nor `cargo binstall` is present in that image), so this
-      # step builds the local extension image (docker/Dockerfile.build — see
-      # that file's header comment for why it exists) to run the
-      # attribution-drift check.
-      - name: Build toolchain extension image (cargo-about)
-        run: docker build -f docker/Dockerfile.build -t cashttpd-toolchain:ci .
+      # `cargo-about` is part of casjaysdev/rust:latest (verified directly
+      # against the image: /usr/local/bin/cargo-about is present), so this
+      # runs straight against the maintained toolchain image — no local
+      # extension image needed (AI.md "Toolchain Image": never create
+      # docker/Dockerfile.build for Rust).
       - name: Attribution-drift check
         run: |
           set -euo pipefail
           docker run --rm \
             --name "$(basename "$GITHUB_REPOSITORY")-$(tr -dc 'a-z0-9' </dev/urandom | head -c8)" \
             --entrypoint sh \
-            -v "$PWD":/work -w /work cashttpd-toolchain:ci \
+            -v "$PWD":/work -w /work casjaysdev/rust:latest \
             -c 'cargo about generate about.hbs' > LICENSE.generated.md
           sed -n '/<!-- GENERATED:/,$p' LICENSE.md > LICENSE.committed-generated.md
           # Some upstream crates (e.g. mime_guess) ship an embedded LICENSE
