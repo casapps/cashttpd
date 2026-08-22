@@ -80,19 +80,29 @@ pipeline {
                         // calls below, which run outside any `agent { docker }`
                         // context and DO need the override).
                         sh 'cargo deny check licenses advisories bans sources'
-                        // `cargo-about` is not part of casjaysdev/rust:latest
-                        // (verified directly against the image), so this
-                        // builds the local extension image
-                        // (docker/Dockerfile.build) to run the
-                        // attribution-drift check.
-                        sh 'docker build -f docker/Dockerfile.build -t cashttpd-toolchain:ci .'
-                        // cashttpd-toolchain:ci is FROM casjaysdev/rust:latest, whose
-                        // default ENTRYPOINT (an unrelated SMTP-config script)
-                        // silently intercepts ad hoc `docker run` invocations unless
-                        // overridden — confirmed via a real GitHub Actions CI run.
-                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work cashttpd-toolchain:ci -c "cargo about generate about.hbs" > LICENSE.generated.md'
+                        // `cargo-about` is part of casjaysdev/rust:latest
+                        // (verified directly against the image:
+                        // /usr/local/bin/cargo-about is present), so this runs
+                        // straight against the maintained toolchain image - no
+                        // local extension image needed (AI.md "Toolchain
+                        // Image": never create docker/Dockerfile.build for
+                        // Rust).
+                        // casjaysdev/rust:latest ships a default ENTRYPOINT (an
+                        // unrelated SMTP-config script) that silently intercepts
+                        // ad hoc `docker run` invocations unless overridden —
+                        // confirmed via a real GitHub Actions CI run.
+                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c "cargo about generate about.hbs" > LICENSE.generated.md'
                         sh "sed -n '/<!-- GENERATED:/,\$p' LICENSE.md > LICENSE.committed-generated.md"
-                        sh 'diff LICENSE.committed-generated.md LICENSE.generated.md'
+                        // Some upstream crates (e.g. mime_guess) ship an embedded
+                        // LICENSE file with CRLF line endings, which cargo-about
+                        // copies verbatim, while `.gitattributes`' `* text=auto`
+                        // normalizes them to LF on commit. Strip \r from both sides
+                        // (via temp files, not process substitution — Jenkins' `sh`
+                        // step runs `/bin/sh`, not bash) so normalization isn't
+                        // reported as drift.
+                        sh 'tr -d "\\r" < LICENSE.committed-generated.md > LICENSE.committed-generated.lf.md'
+                        sh 'tr -d "\\r" < LICENSE.generated.md > LICENSE.generated.lf.md'
+                        sh 'diff LICENSE.committed-generated.lf.md LICENSE.generated.lf.md'
                     }
                 }
             }
@@ -231,10 +241,14 @@ pipeline {
                         docker { image "${RUST_IMAGE}"; reuseNode true }
                     }
                     steps {
-                        sh 'docker build -f docker/Dockerfile.build -t cashttpd-toolchain:release .'
-                        // Same default-ENTRYPOINT interception issue as the
-                        // License Compliance stage above — see its comment.
-                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work cashttpd-toolchain:release -c "cargo cyclonedx --format json"'
+                        // `cargo-cyclonedx` is part of casjaysdev/rust:latest
+                        // (verified directly against the image:
+                        // /usr/local/bin/cargo-cyclonedx is present) - no local
+                        // extension image needed (AI.md "Toolchain Image":
+                        // never create docker/Dockerfile.build for Rust). Same
+                        // default-ENTRYPOINT interception issue as the License
+                        // Compliance stage above — see its comment.
+                        sh 'docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c "cargo cyclonedx --format json"'
                         sh 'cp bom.json binaries/cashttpd-bom.json'
                         // Two aggregate checksum files covering every published
                         // artifact (AI.md PART 2 "Binary Model" / PART 5 "Release

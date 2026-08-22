@@ -30,6 +30,31 @@ allow = [
   # not copyleft; see AI.md PART 11 "License Allowlist (default)".
   "CDLA-Permissive-2.0",
 ]
+# Explicit denylist (AI.md PART 11 "License Denylist"). The allowlist above
+# already rejects anything unlisted, so these entries are belt-and-braces:
+# they make the refusal reason self-documenting and stop a copyleft license
+# from being waved through by a future careless allowlist edit. Every one of
+# these breaks the MIT single-static-binary deliverable, so admitting one
+# requires the AI.md PART 11 "IDEA.md Exception Path", not a deny.toml edit.
+deny = [
+  # Strong copyleft - static linking relicenses the whole binary away from MIT.
+  "GPL-2.0",
+  "GPL-3.0",
+  # Strong copyleft plus a network-use clause.
+  "AGPL-1.0",
+  "AGPL-3.0",
+  # LGPL section 6 under static linking requires shipping object files or a
+  # written relink offer alongside the binary.
+  "LGPL-2.0",
+  "LGPL-2.1",
+  "LGPL-3.0",
+  # Service-source copyleft; treated like AGPL here.
+  "SSPL-1.0",
+  # Source-available with commercial-use restrictions; not OSI-approved.
+  "Commons-Clause",
+  "BUSL-1.1",
+  "Elastic-2.0",
+]
 confidence-threshold = 0.8
 
 [bans]

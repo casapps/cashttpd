@@ -214,47 +214,66 @@ fn fallback_defaults() -> ServeOptions {
 /// `--debug` into a `CliOverrides` (IDEA.md "CLI flags (full reference)").
 /// `--daemon`/`--quiet`/`--config-test` are invocation-shape flags handled
 /// by `crate::uis::cli`, not persisted settings — they are not parsed here.
+///
+/// Both the space form (`--port 9090`) and the `=` form (`--port=9090`) are
+/// accepted. clap's grammar accepts both, and this function re-derives the
+/// real values from raw argv so precedence layering stays in one place, so
+/// only matching the space form here would let `--port=9090` parse cleanly at
+/// the CLI and then be silently dropped.
 pub fn parse_cli_overrides(args: &[String]) -> crate::configs::CliOverrides {
     let mut o = crate::configs::CliOverrides::default();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        // Split `--flag=value` into its two halves; a bare `--flag` yields no
+        // inline value and falls back to consuming the next argument.
+        let (flag, inline) = match args[i].split_once('=') {
+            Some((f, v)) => (f, Some(v.to_string())),
+            None => (args[i].as_str(), None),
+        };
+
+        // Takes the inline `=` value when present, otherwise the following
+        // argument, advancing past it so it is not re-scanned as a flag.
+        let value = |i: &mut usize| -> Option<String> {
+            match &inline {
+                Some(v) => Some(v.clone()),
+                None => args.get(*i + 1).map(|v| {
+                    *i += 1;
+                    v.clone()
+                }),
+            }
+        };
+
+        match flag {
             "--listen" => {
-                if let Some(v) = args.get(i + 1) {
-                    o.listen = Some(v.clone());
-                    i += 1;
+                if let Some(v) = value(&mut i) {
+                    o.listen = Some(v);
                 }
             }
             "--port" => {
-                if let Some(v) = args.get(i + 1) {
+                if let Some(v) = value(&mut i) {
                     if let Ok(p) = v.parse() {
                         o.port = Some(p);
                     }
-                    i += 1;
                 }
             }
             "--dir" => {
-                if let Some(v) = args.get(i + 1) {
+                if let Some(v) = value(&mut i) {
                     o.base_dir = Some(PathBuf::from(v));
-                    i += 1;
                 }
             }
             "--fqdn" => {
-                if let Some(v) = args.get(i + 1) {
-                    o.fqdn = Some(v.clone());
-                    i += 1;
+                if let Some(v) = value(&mut i) {
+                    o.fqdn = Some(v);
                 }
             }
             "--log" => {
-                if let Some(v) = args.get(i + 1) {
+                if let Some(v) = value(&mut i) {
                     o.log_dir = Some(PathBuf::from(v));
-                    i += 1;
                 }
             }
             "--config" => {
-                if let Some(v) = args.get(i + 1) {
+                if let Some(v) = value(&mut i) {
                     o.config_path = Some(PathBuf::from(v));
-                    i += 1;
                 }
             }
             "--debug" => {
@@ -3015,6 +3034,33 @@ mod tests {
         assert_eq!(o.fqdn.as_deref(), Some("example.test"));
         assert_eq!(o.log_dir, Some(log));
         assert_eq!(o.debug, Some(true));
+    }
+
+    /// clap accepts `--port=9090`, so this parser must too. It previously
+    /// matched only the space form, which let the `=` form validate cleanly
+    /// at the CLI and then get silently dropped — the server would start on a
+    /// random port with no error.
+    #[test]
+    fn parse_cli_overrides_reads_the_equals_form_identically() {
+        let dir = std::env::temp_dir().join("somewhere");
+        let args = vec![
+            "--listen=127.0.0.1".to_string(),
+            "--port=9090".to_string(),
+            format!("--dir={}", dir.to_string_lossy()),
+            "--fqdn=example.test".to_string(),
+        ];
+        let o = parse_cli_overrides(&args);
+        assert_eq!(o.listen.as_deref(), Some("127.0.0.1"));
+        assert_eq!(o.port, Some(9090));
+        assert_eq!(o.base_dir, Some(dir));
+        assert_eq!(o.fqdn.as_deref(), Some("example.test"));
+    }
+
+    /// A value containing `=` must survive the split intact.
+    #[test]
+    fn parse_cli_overrides_splits_only_on_the_first_equals() {
+        let o = parse_cli_overrides(&["--fqdn=a=b".to_string()]);
+        assert_eq!(o.fqdn.as_deref(), Some("a=b"));
     }
 
     #[test]

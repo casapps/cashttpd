@@ -81,7 +81,18 @@ pub fn size(bytes: u64) -> String {
         idx += 1;
     }
 
-    let rounded = (value * 10.0).round() / 10.0;
+    let mut rounded = (value * 10.0).round() / 10.0;
+    // Rounding to one decimal can push the value back up onto the next
+    // boundary (1048575 bytes divides to 1023.999 KB, which rounds to
+    // 1024.0). Without this step it would render as "1024 kilobytes" instead
+    // of "1 megabyte", breaking the largest-fitting-unit rule for a one-byte
+    // window below every boundary.
+    if rounded >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+        rounded = (value * 10.0).round() / 10.0;
+    }
+
     let (s, p) = UNITS[idx];
     let unit_name = if rounded == 1.0 { s } else { p };
 
@@ -129,6 +140,19 @@ mod tests {
         assert_eq!(size(1024), "1 kilobyte");
         assert_eq!(size(1024 * 1024 * 5 / 2), "2.5 megabytes");
         assert_eq!(size(5u64 * 1024 * 1024 * 1024), "5 gigabytes");
+    }
+
+    /// One byte below each boundary the division leaves a value that rounds
+    /// up to exactly 1024, which must carry into the next unit rather than
+    /// render as "1024 kilobytes".
+    #[test]
+    fn size_carries_into_the_next_unit_when_rounding_hits_the_boundary() {
+        assert_eq!(size(1024 * 1024 - 1), "1 megabyte");
+        assert_eq!(size(1024 * 1024 * 1024 - 1), "1 gigabyte");
+        assert_eq!(size(1024u64.pow(4) - 1), "1 terabyte");
+        // The largest unit has nowhere to carry to, so it keeps accumulating
+        // rather than inventing a petabyte row.
+        assert_eq!(size(u64::MAX), "16777216 terabytes");
     }
 
     #[test]

@@ -11,4 +11,4 @@ services:
       - "127.0.0.1:59123:59123"
     volumes:
       - ../:/srv/www:ro
-    command: ["--listen", "::1", "--port", "59123", "--dir", "/srv/www"]
+    command: ["serve", "--listen", "::1", "--port", "59123", "--dir", "/srv/www"]

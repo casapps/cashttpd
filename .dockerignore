@@ -5,5 +5,8 @@ target/
 xtask/target/
 volumes/
 *.md
-LICENSE.md
+# LICENSE.md is a compile input, not documentation - src/assets.rs embeds it
+# with include_str! so --licenses/--credits can print it (AI.md PART 11).
+# Excluding it here breaks the build, so it is re-included after *.md above.
+!LICENSE.md
 .DS_Store

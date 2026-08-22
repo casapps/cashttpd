@@ -12,10 +12,11 @@ day-to-day command.
 docker pull casjaysdev/rust:latest
 ```
 
-`docker/Dockerfile.build` is a narrow extension of that same image (see its
-header comment): it adds `cargo-about` and `cargo-cyclonedx`, which the base
-image does not ship, and is used only by the CI license-compliance and SBOM
-steps.
+That image already ships `cargo-about` and `cargo-cyclonedx`, so the CI
+license-compliance and SBOM steps run straight against it. There is no
+`docker/Dockerfile.build` in this repo and there must never be one — AI.md
+PART 5 "Toolchain Image" forbids a local toolchain extension image for Rust
+projects.
 
 ## Build the runtime image
 

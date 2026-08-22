@@ -46,13 +46,18 @@ license-compliance:
     # `docker run` that doesn't explicitly override it — confirmed via a
     # real GitHub Actions CI run. `--entrypoint sh -c '...'` bypasses it.
     - docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo deny check licenses advisories bans sources'
-    # `cargo-about` is not part of casjaysdev/rust:latest (verified directly
-    # against the image), so this builds the local extension image
-    # (docker/Dockerfile.build) to run the attribution-drift check.
-    - docker build -f docker/Dockerfile.build -t "$CI_REGISTRY_IMAGE/toolchain:ci" .
-    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:ci" -c 'cargo about generate about.hbs' > LICENSE.generated.md
+    # `cargo-about` is part of casjaysdev/rust:latest (verified directly
+    # against the image: /usr/local/bin/cargo-about is present), so this runs
+    # straight against the maintained toolchain image - no local extension
+    # image needed (AI.md "Toolchain Image": never create
+    # docker/Dockerfile.build for Rust). Same ENTRYPOINT override as above.
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo about generate about.hbs' > LICENSE.generated.md
     - sed -n '/<!-- GENERATED:/,$p' LICENSE.md > LICENSE.committed-generated.md
-    - diff LICENSE.committed-generated.md LICENSE.generated.md
+    # Some upstream crates (e.g. mime_guess) ship an embedded LICENSE file
+    # with CRLF line endings, which cargo-about copies verbatim, while
+    # `.gitattributes`' `* text=auto` normalizes them to LF on commit. Strip
+    # \r from both sides so that normalization isn't reported as drift.
+    - diff <(tr -d '\r' < LICENSE.committed-generated.md) <(tr -d '\r' < LICENSE.generated.md)
 
 build:
   stage: build
@@ -178,9 +183,12 @@ release-sbom:
   services:
     - docker:dind
   script:
-    - docker build -f docker/Dockerfile.build -t "$CI_REGISTRY_IMAGE/toolchain:release" .
-    # toolchain:release is FROM casjaysdev/rust:latest — same ENTRYPOINT fix.
-    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work "$CI_REGISTRY_IMAGE/toolchain:release" -c 'cargo cyclonedx --format json'
+    # `cargo-cyclonedx` is part of casjaysdev/rust:latest (verified directly
+    # against the image: /usr/local/bin/cargo-cyclonedx is present), so this
+    # runs straight against the maintained toolchain image - no local
+    # extension image needed (AI.md "Toolchain Image": never create
+    # docker/Dockerfile.build for Rust). Same ENTRYPOINT override as above.
+    - docker run --rm --entrypoint sh -v "$PWD":/work -w /work casjaysdev/rust:latest -c 'cargo cyclonedx --format json'
     - cp bom.json "binaries/cashttpd-bom.json"
     # Two aggregate checksum files covering every published artifact
     # (AI.md PART 2 "Binary Model" / PART 5 "Release Artifacts") — never

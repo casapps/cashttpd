@@ -37,7 +37,29 @@ fn cli() -> Command {
                 )
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("licenses")
+                .long("licenses")
+                .alias("credits")
+                .help(
+                    "Print the full embedded LICENSE.md (third-party \
+                     attributions included) and exit",
+                )
+                .action(ArgAction::SetTrue),
+        )
         .arg(color_arg())
+        .arg(debug_arg())
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .help(
+                    "Force CLI-style output instead of TUI; with `serve`, \
+                     print the startup banner only (consumed before this \
+                     parser runs; accepted here so a real invocation still \
+                     validates)",
+                )
+                .action(ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("daemon")
                 .long("daemon")
@@ -84,13 +106,23 @@ fn cli() -> Command {
                         .value_parser(clap::value_parser!(std::path::PathBuf)),
                 )
                 .arg(color_arg())
-                .arg(
-                    Arg::new("debug")
-                        .long("debug")
-                        .help("Enable debug/tracing mode")
-                        .action(ArgAction::SetTrue),
-                ),
+                .arg(debug_arg()),
         )
+}
+
+/// The universal `--debug` flag (AI.md "Standard CLI Flags" — Universal Flags
+/// apply to ALL binaries, so it must parse at the top level too, not only on
+/// `serve`). Declared identically on both so it is accepted on either side of
+/// the subcommand, exactly like `--color`.
+///
+/// No downstream wiring is needed: `crate::servers::parse_cli_overrides`
+/// scans the raw argv positionally and already picks `--debug` up wherever it
+/// appears.
+fn debug_arg() -> Arg {
+    Arg::new("debug")
+        .long("debug")
+        .help("Enable debug/tracing mode")
+        .action(ArgAction::SetTrue)
 }
 
 /// The standard three-value `--color` flag, declared identically at the top
@@ -110,6 +142,20 @@ fn color_arg() -> Arg {
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run_with_args(&args));
+}
+
+/// The binary name as actually invoked, taken from argv[0].
+///
+/// AI.md "Output Rules" requires help and version output to show the actual
+/// invoked binary name, so a renamed or symlinked binary must not keep
+/// announcing itself as `cashttpd`. clap derives usage lines from argv[0]
+/// already; this covers the hand-written `--version` and `--licenses` output.
+fn invoked_name(args: &[String]) -> String {
+    args.first()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string())
 }
 
 /// Dispatch logic split out from `run()` so it is unit testable without
@@ -146,7 +192,8 @@ fn run_with_args(args: &[String]) -> i32 {
     // PART 6 "Build Metadata") and exit.
     if matches.get_flag("version") {
         println!(
-            "cashttpd {} (commit {}, built {}){}",
+            "{} {} (commit {}, built {}){}",
+            invoked_name(args),
             crate::supports::version::VERSION,
             crate::supports::version::COMMIT_ID,
             crate::supports::version::build_date(),
@@ -156,6 +203,21 @@ fn run_with_args(args: &[String]) -> i32 {
                 format!(" — {}", crate::supports::version::OFFICIAL_SITE)
             }
         );
+        return 0;
+    }
+
+    // `--licenses` / `--credits`: print the compile-time-embedded LICENSE.md
+    // in full, with the version, commit ID, and build date shown alongside it
+    // (AI.md PART 11 "User-Visible Attribution Surface").
+    if matches.get_flag("licenses") {
+        println!(
+            "{} {} (commit {}, built {})\n",
+            invoked_name(args),
+            crate::supports::version::VERSION,
+            crate::supports::version::COMMIT_ID,
+            crate::supports::version::build_date(),
+        );
+        print!("{}", crate::assets::LICENSE_TEXT);
         return 0;
     }
 
@@ -183,7 +245,9 @@ fn run_with_args(args: &[String]) -> i32 {
     // stays unconditional) are CLI-only invocation flags, never persisted
     // to config (IDEA.md "CLI flags (full reference)").
     if let Some(serve_matches) = matches.subcommand_matches("serve") {
-        let quiet = serve_matches.get_flag("quiet");
+        // `--quiet` is accepted on either side of the subcommand, so honor a
+        // top-level occurrence too rather than silently ignoring it.
+        let quiet = serve_matches.get_flag("quiet") || matches.get_flag("quiet");
         // The actual override values are re-derived from the raw argument
         // list by `crate::servers::parse_serve_options`/`parse_cli_overrides`
         // — the single place that layers CLI flag > env var > per-project
@@ -201,7 +265,11 @@ fn run_with_args(args: &[String]) -> i32 {
         };
     }
 
-    println!("cashttpd {} (cli mode)", crate::supports::version::VERSION);
+    println!(
+        "{} {} (cli mode)",
+        invoked_name(args),
+        crate::supports::version::VERSION
+    );
     0
 }
 
@@ -261,6 +329,46 @@ mod tests {
             Some(ValueSource::CommandLine),
             "an explicit serve-level --color must outrank the top-level default"
         );
+    }
+
+    /// AI.md "Standard CLI Flags" makes `--debug` universal, so it must parse
+    /// at the top level and not only on `serve`.
+    #[test]
+    fn debug_flag_is_accepted_at_the_top_level_and_on_serve() {
+        assert_eq!(run_with_args(&args(&["--debug", "--version"])), 0);
+        cli()
+            .try_get_matches_from(args(&["--debug"]))
+            .expect("--debug parses at the top level");
+        cli()
+            .try_get_matches_from(args(&["serve", "--debug"]))
+            .expect("--debug still parses on serve");
+    }
+
+    /// `--quiet` is a mode-selection trigger (IDEA.md "CLI flags"), so it has
+    /// to parse before the subcommand too.
+    #[test]
+    fn quiet_flag_is_accepted_at_the_top_level_and_on_serve() {
+        cli()
+            .try_get_matches_from(args(&["--quiet"]))
+            .expect("--quiet parses at the top level");
+        cli()
+            .try_get_matches_from(args(&["serve", "--quiet"]))
+            .expect("--quiet still parses on serve");
+    }
+
+    #[test]
+    fn licenses_flag_and_its_credits_alias_print_the_embedded_text() {
+        assert_eq!(run_with_args(&args(&["--licenses"])), 0);
+        assert_eq!(run_with_args(&args(&["--credits"])), 0);
+        assert!(crate::assets::LICENSE_TEXT.contains("# Project License"));
+    }
+
+    /// AI.md "Output Rules": version output shows the actual invoked name.
+    #[test]
+    fn invoked_name_comes_from_argv0_and_strips_any_directory() {
+        assert_eq!(invoked_name(&["cashttpd".to_string()]), "cashttpd");
+        assert_eq!(invoked_name(&["/usr/local/bin/webby".to_string()]), "webby");
+        assert_eq!(invoked_name(&[]), env!("CARGO_PKG_NAME"));
     }
 
     #[test]

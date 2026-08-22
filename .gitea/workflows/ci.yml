@@ -257,6 +257,10 @@ jobs:
       needs.detect.outputs.has_dockerfile == 'true'
     runs-on: ubuntu-latest
     permissions:
+      # actions/checkout needs read access to the repository contents; a
+      # job-level permissions block replaces the workflow-level one entirely,
+      # so contents: read must be restated here, not inherited.
+      contents: read
       # push the devel image to the provider's container registry
       packages: write
     steps:
