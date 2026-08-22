@@ -123,6 +123,7 @@ security assumptions, and any exceptions.)
 - Do not scatter top-level files unnecessarily
 - Runtime-generated files are not committed
 - AI must not move the project root or invent sibling repositories
+- **Never edit files outside the project root to work around a problem inside it** — no host system files (`/etc/*`, shell rc files, systemd units), no sibling/other repositories, no global tool configs. A failing build, missing dependency, or broken tool inside the project is fixed in the project's own code/config/Docker image, never by reaching outside it. The only exception is an external path the user explicitly names for that specific task
 
 ## ⚠️ CRITICAL: AI.md is the Source of Truth
 
