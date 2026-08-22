@@ -30,31 +30,16 @@ allow = [
   # not copyleft; see AI.md PART 11 "License Allowlist (default)".
   "CDLA-Permissive-2.0",
 ]
-# Explicit denylist (AI.md PART 11 "License Denylist"). The allowlist above
-# already rejects anything unlisted, so these entries are belt-and-braces:
-# they make the refusal reason self-documenting and stop a copyleft license
-# from being waved through by a future careless allowlist edit. Every one of
-# these breaks the MIT single-static-binary deliverable, so admitting one
-# requires the AI.md PART 11 "IDEA.md Exception Path", not a deny.toml edit.
-deny = [
-  # Strong copyleft - static linking relicenses the whole binary away from MIT.
-  "GPL-2.0",
-  "GPL-3.0",
-  # Strong copyleft plus a network-use clause.
-  "AGPL-1.0",
-  "AGPL-3.0",
-  # LGPL section 6 under static linking requires shipping object files or a
-  # written relink offer alongside the binary.
-  "LGPL-2.0",
-  "LGPL-2.1",
-  "LGPL-3.0",
-  # Service-source copyleft; treated like AGPL here.
-  "SSPL-1.0",
-  # Source-available with commercial-use restrictions; not OSI-approved.
-  "Commons-Clause",
-  "BUSL-1.1",
-  "Elastic-2.0",
-]
+# AI.md PART 11 "License Denylist": every license listed there (GPL-2.0/3.0,
+# AGPL-1.0/3.0, LGPL-2.0/2.1/3.0, SSPL-1.0, Commons-Clause, BUSL-1.1,
+# Elastic-2.0 — each breaking the MIT single-static-binary deliverable under
+# static linking or a network-use/source-available clause) is refused
+# implicitly: cargo-deny's `[licenses] deny` key was removed upstream
+# (EmbarkStudios/cargo-deny#611 — confirmed against this project's pinned
+# casjaysdev/rust:latest cargo-deny, which errors on the deprecated key) in
+# favor of the allowlist above being exhaustive — anything not explicitly
+# allowed is denied by default. Admitting one of these requires the AI.md
+# PART 11 "IDEA.md Exception Path", not a deny.toml edit.
 confidence-threshold = 0.8
 
 [bans]
